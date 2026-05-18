@@ -904,3 +904,84 @@ pub async fn update_profile_settings(
 pub async fn list_sounds() -> Json<Vec<String>> {
     Json(crate::sound::list_available_sounds())
 }
+
+/// Serve a sound file by name so the cockpit's browser-side approval
+/// player can fetch it from the same origin as the dashboard. The name
+/// is validated against `list_available_sounds()` to block path
+/// traversal: an attacker who can hit `/api/sounds/file/<x>` cannot
+/// read arbitrary disk paths, only files already present in the user's
+/// `sounds/` directory.
+pub async fn serve_sound_file(
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    // The validation step (directory enumeration) stays on the blocking
+    // pool because `list_available_sounds` does sync `read_dir`. The
+    // file read itself uses `tokio::fs::read` so the larger I/O cost
+    // does not block a runtime worker.
+    let lookup_name = name.clone();
+    let validated = tokio::task::spawn_blocking(move || {
+        if !crate::sound::list_available_sounds().contains(&lookup_name) {
+            return None;
+        }
+        crate::sound::get_sounds_dir().map(|dir| dir.join(&lookup_name))
+    })
+    .await;
+
+    let path = match validated {
+        Ok(Some(p)) => p,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let content_type = match std::path::Path::new(&name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("ogg") => "audio/ogg",
+        _ => "audio/wav",
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, content_type),
+            (axum::http::header::CACHE_CONTROL, "private, max-age=3600"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn serve_sound_file_rejects_unknown_name() {
+        let resp = serve_sound_file(axum::extract::Path("does-not-exist-xyz.wav".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn serve_sound_file_rejects_path_traversal() {
+        let resp = serve_sound_file(axum::extract::Path("../../../etc/passwd".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // A NOT_FOUND that somehow still streamed a body would be a
+        // worse failure than the wrong status, so assert the body is
+        // empty rather than just "not /etc/passwd".
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert!(body.is_empty(), "unexpected body bytes: {body:?}");
+    }
+}

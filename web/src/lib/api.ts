@@ -245,6 +245,21 @@ export async function fetchSounds(): Promise<string[]> {
   return (await fetchJson<string[]>("/api/sounds")) ?? [];
 }
 
+/** Fetch a sound file as a Blob so the cockpit's browser-side approval
+ *  player can hand a blob URL to `new Audio(...)`. The fetch path runs
+ *  through `fetchInterceptor.ts`, which injects `Authorization: Bearer`
+ *  on every request; an `<audio src="...">` element does not, so a
+ *  blob round-trip is necessary in PWA mode. See #1038. */
+export async function fetchSoundBlob(name: string): Promise<Blob | null> {
+  try {
+    const res = await fetch(`/api/sounds/file/${encodeURIComponent(name)}`);
+    if (!res.ok) return null;
+    return await res.blob();
+  } catch {
+    return null;
+  }
+}
+
 // --- About / server info ---
 
 export interface ServerAbout {
@@ -698,6 +713,17 @@ export async function logout(): Promise<void> {
     try {
       const { clearDeviceBindingSecret } = await import("./deviceBinding");
       clearDeviceBindingSecret();
+    } catch {
+      // ignore
+    }
+    // Drop the in-memory approval-sound caches so a future user on the
+    // same tab does not see the previous user's settings snapshot or
+    // hear their cached blob.
+    try {
+      const { clearApprovalSoundCache } = await import(
+        "../hooks/useApprovalSound"
+      );
+      clearApprovalSoundCache();
     } catch {
       // ignore
     }
