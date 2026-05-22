@@ -4063,6 +4063,285 @@ fn restart_selected_session_debounces_via_cooldown_map() {
     );
 }
 
+/// Build a HomeView seeded with two distinct projects, each containing
+/// sessions with different attention statuses. Helper for the Project +
+/// Attention combination tests below.
+fn create_test_env_two_projects_mixed_attention() -> TestEnv {
+    use crate::session::Status;
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let storage = Storage::new("test").unwrap();
+
+    let mut alpha_waiting = Instance::new("alpha-waiting", "/repos/alpha");
+    alpha_waiting.status = Status::Waiting;
+    let mut alpha_running = Instance::new("alpha-running", "/repos/alpha");
+    alpha_running.status = Status::Running;
+
+    let mut beta_running = Instance::new("beta-running", "/repos/beta");
+    beta_running.status = Status::Running;
+    let mut beta_error = Instance::new("beta-error", "/repos/beta");
+    beta_error.status = Status::Error;
+
+    let instances = vec![alpha_waiting, alpha_running, beta_running, beta_error];
+    storage
+        .commit(&instances, &GroupTree::new_with_groups(&instances, &[]))
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    TestEnv { _temp: temp, view }
+}
+
+/// Project grouping must survive Attention sort. Previously `build_flat_items`
+/// short-circuited on `SortOrder::Attention` before checking `GroupByMode`,
+/// flattening the list and dropping project headers. The headers are the
+/// whole point of project mode; users want attention triage WITHIN their
+/// project boundaries, not a flat firehose across projects.
+#[test]
+#[serial]
+fn project_grouping_survives_attention_sort() {
+    use crate::session::config::{GroupByMode, SortOrder};
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.sort_order = SortOrder::Attention;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let group_count = env
+        .view
+        .flat_items
+        .iter()
+        .filter(|i| matches!(i, Item::Group { .. }))
+        .count();
+    assert_eq!(
+        group_count, 2,
+        "Project + Attention must keep both project headers (alpha, beta), \
+         got flat_items: {:?}",
+        env.view.flat_items
+    );
+
+    let group_names: Vec<String> = env
+        .view
+        .flat_items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Group { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        group_names.iter().any(|n| n == "alpha") && group_names.iter().any(|n| n == "beta"),
+        "expected alpha and beta project headers, got {group_names:?}"
+    );
+}
+
+/// Within a project group under Attention sort, sessions must order by
+/// attention tier: Waiting (tier 0) above Running (tier 4). Confirms that
+/// the existing `sort_sessions` helper, already reached by the project
+/// flatten path via `flatten_tree`, is doing its job once we stopped
+/// short-circuiting it.
+#[test]
+#[serial]
+fn project_grouping_sorts_sessions_by_attention_within_group() {
+    use crate::session::config::{GroupByMode, SortOrder};
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.sort_order = SortOrder::Attention;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let mut current_group: Option<String> = None;
+    let mut alpha_session_order: Vec<String> = Vec::new();
+    for item in &env.view.flat_items {
+        match item {
+            Item::Group { name, .. } => current_group = Some(name.clone()),
+            Item::Session { id, .. } => {
+                if current_group.as_deref() == Some("alpha") {
+                    if let Some(inst) = env.view.instances.iter().find(|i| &i.id == id) {
+                        alpha_session_order.push(inst.title.clone());
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        alpha_session_order,
+        vec!["alpha-waiting".to_string(), "alpha-running".to_string()],
+        "Waiting session must rank above Running within the alpha group"
+    );
+}
+
+/// The most-attention-urgent project floats to the top. `attention_group_key`
+/// scores groups by their best member's tier; beta has an Error (tier 1)
+/// while alpha's best is Waiting (tier 0), so alpha sorts first. This
+/// confirms that the existing group-sort path is reached for project mode
+/// under Attention sort.
+#[test]
+#[serial]
+fn project_groups_sort_by_top_attention_member() {
+    use crate::session::config::{GroupByMode, SortOrder};
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.sort_order = SortOrder::Attention;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let group_order: Vec<String> = env
+        .view
+        .flat_items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Group { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        group_order,
+        vec!["alpha".to_string(), "beta".to_string()],
+        "alpha (Waiting=tier 0) must sort above beta (Error=tier 1)"
+    );
+}
+
+/// Pressing `g` to flip `group_by` keeps the cursor on the previously
+/// selected session, even when the list reshapes (Manual flat list →
+/// Project grouped list). Previously `apply_group_by` clamped by index,
+/// which landed the cursor on whatever row slid into the old slot once
+/// project headers got inserted. The fix seeks `selected_session` by id
+/// after the rebuild.
+#[test]
+#[serial]
+fn group_by_toggle_preserves_selected_session() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Manual;
+    env.view.sort_order = crate::session::config::SortOrder::Newest;
+    env.view.flat_items = env.view.build_flat_items();
+
+    // Pick the last session in the Manual flat list; that's the row whose
+    // index is most likely to be invalidated when project headers get
+    // inserted in front of it.
+    let target_id = env
+        .view
+        .flat_items
+        .iter()
+        .rev()
+        .find_map(|i| match i {
+            Item::Session { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("manual flat list should contain at least one session");
+    env.view.select_session_by_id(&target_id);
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(target_id.as_str())
+    );
+
+    env.view.handle_key(key(KeyCode::Char('g')), None);
+    assert_eq!(env.view.group_by, GroupByMode::Project);
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(target_id.as_str()),
+        "cursor must stay on the same session after group_by flip"
+    );
+    let cursor_item = env
+        .view
+        .flat_items
+        .get(env.view.cursor)
+        .expect("cursor must point into flat_items");
+    match cursor_item {
+        Item::Session { id, .. } => assert_eq!(id, &target_id),
+        Item::Group { .. } => panic!("cursor landed on a group header, not the session"),
+    }
+}
+
+/// Pressing `o` to flip `sort_order` keeps the cursor on the previously
+/// selected session. Most visible when going Newest → Attention with
+/// Project grouping on, since Attention reorders both groups (by top
+/// member) and sessions within each group, so the target session is very
+/// unlikely to keep its index across the rebuild.
+#[test]
+#[serial]
+fn sort_order_toggle_preserves_selected_session() {
+    use crate::session::config::{GroupByMode, SortOrder};
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.sort_order = SortOrder::Newest;
+    env.view.flat_items = env.view.build_flat_items();
+
+    // Pin the Running session inside alpha. Under Attention sort it sinks
+    // below alpha-waiting, so its index will shift on the rebuild.
+    let target_id = env
+        .view
+        .instances
+        .iter()
+        .find(|i| i.title == "alpha-running")
+        .map(|i| i.id.clone())
+        .expect("fixture provides alpha-running");
+    env.view.select_session_by_id(&target_id);
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(target_id.as_str())
+    );
+
+    env.view.handle_key(key(KeyCode::Char('o')), None);
+    assert_eq!(env.view.sort_order, SortOrder::Attention);
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(target_id.as_str()),
+        "cursor must stay on the same session after sort_order flip"
+    );
+}
+
+/// `reseat_cursor_after_rebuild` falls back to index clamping when there
+/// is no prior session selection. Guards against the helper accidentally
+/// regressing the empty-or-group-only path, where the original clamp
+/// logic was correct.
+#[test]
+#[serial]
+fn reseat_cursor_clamps_when_no_session_selected() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.selected_session = None;
+    env.view.cursor = env.view.flat_items.len() + 50; // intentionally out of range
+
+    env.view.reseat_cursor_after_rebuild();
+    assert!(
+        env.view.cursor < env.view.flat_items.len(),
+        "cursor must be clamped into the flat_items range"
+    );
+}
+
+/// Manual grouping + Attention sort must still flatten. The cross-cutting
+/// flat priority view is the original Attention design and is the right
+/// behavior when the user has not opted into project grouping. Guards
+/// against an over-eager refactor flipping both modes to grouped.
+#[test]
+#[serial]
+fn manual_grouping_attention_sort_stays_flat() {
+    use crate::session::config::{GroupByMode, SortOrder};
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Manual;
+    env.view.sort_order = SortOrder::Attention;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let group_count = env
+        .view
+        .flat_items
+        .iter()
+        .filter(|i| matches!(i, Item::Group { .. }))
+        .count();
+    assert_eq!(
+        group_count, 0,
+        "Manual + Attention should produce a flat list, no group headers"
+    );
+}
+
 mod scroll_pane_isolation {
     //! Wheel events are confined to whichever pane the mouse is over.
     //! In particular, a wheel over the preview pane never moves the list
