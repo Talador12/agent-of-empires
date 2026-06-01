@@ -1922,7 +1922,11 @@ impl Instance {
                 // Install hooks in the user's home directory settings
                 if let Some(home) = dirs::home_dir() {
                     let settings_path = home.join(hook_cfg.settings_rel_path);
-                    if let Err(e) = crate::hooks::install_hooks(&settings_path, hook_cfg.events) {
+                    if let Err(e) = crate::hooks::install_hooks(
+                        &settings_path,
+                        hook_cfg.events,
+                        crate::hooks::HookInstallTarget::Host,
+                    ) {
                         tracing::warn!(target: "session.store", "Failed to install agent hooks: {}", e);
                     }
                 }
