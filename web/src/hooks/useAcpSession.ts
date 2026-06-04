@@ -54,6 +54,7 @@ export type Action =
   | { kind: "prompt_send_rejected" }
   | { kind: "error"; message: string }
   | { kind: "clear_error" }
+  | { kind: "approval_resolved_locally"; nonce: string }
   | { kind: "lagged_resolved" }
   | { kind: "reset" }
   | { kind: "hydrate"; state: AcpState }
@@ -384,7 +385,39 @@ export function combineQueuedPrompts(
     .join("\n\n");
 }
 
-function reducer(state: AcpState, action: Action): AcpState {
+/** Outcome of an approval-resolve POST: the card should clear, or an
+ *  error banner should show. Pure so it can be unit-tested without the
+ *  full hook. See #1821. */
+export type ApprovalResolveOutcome =
+  | { kind: "resolved" }
+  | { kind: "error"; message: string };
+
+/** Classify an approval-resolve response. A 204 (ok) or a 404 whose body
+ *  names *this* nonce both mean "this card is done" and clear it; any other
+ *  failure (a session-gone 404, or a 404 that doesn't name the nonce)
+ *  surfaces an error. Matching the nonce keeps a generic 404 from silently
+ *  clearing the clicked card. See #1821. */
+export function classifyApprovalResolveResponse(
+  ok: boolean,
+  status: number,
+  detail: string,
+  nonce: string,
+): ApprovalResolveOutcome {
+  if (ok) return { kind: "resolved" };
+  if (
+    status === 404 &&
+    /no pending approval/i.test(detail) &&
+    detail.includes(nonce)
+  ) {
+    return { kind: "resolved" };
+  }
+  return {
+    kind: "error",
+    message: `Could not resolve approval (${status}). ${detail}`.trim(),
+  };
+}
+
+export function reducer(state: AcpState, action: Action): AcpState {
   if (action.kind === "frame") {
     return applyEvent(state, action.frame);
   }
@@ -402,6 +435,23 @@ function reducer(state: AcpState, action: Action): AcpState {
   }
   if (action.kind === "clear_error") {
     return { ...state, lastError: null };
+  }
+  if (action.kind === "approval_resolved_locally") {
+    // Optimistically drop the approval card once the server has accepted
+    // the decision (204) or reports the nonce already gone (404), instead
+    // of waiting on the ApprovalResolved broadcast, which the seq dedupe
+    // can swallow and leave the card stuck. See #1821.
+    const pendingApprovals = state.pendingApprovals.filter(
+      (a) => a.nonce !== action.nonce,
+    );
+    // Only clear the error banner when a card was actually removed, so a
+    // duplicate or stale action can't quietly hide an unrelated error.
+    const removed = pendingApprovals.length !== state.pendingApprovals.length;
+    return {
+      ...state,
+      lastError: removed ? null : state.lastError,
+      pendingApprovals,
+    };
   }
   if (action.kind === "hydrate") {
     return action.state;
@@ -1044,15 +1094,24 @@ export function useAcpSession(
             body: JSON.stringify({ decision }),
           },
         );
-        if (!res.ok) {
-          const detail = await safeText(res);
-          dispatch({
-            kind: "error",
-            message:
-              `Could not resolve approval (${res.status}). ${detail}`.trim(),
-          });
+        const detail = res.ok ? "" : await safeText(res);
+        const outcome = classifyApprovalResolveResponse(
+          res.ok,
+          res.status,
+          detail,
+          nonce,
+        );
+        if (outcome.kind === "resolved") {
+          // 204, or a 404 that names the missing nonce: the decision was
+          // accepted or already resolved server-side (a concurrent
+          // decision, a watchdog cancel, or the agent picking no matching
+          // option). Clear the card now rather than waiting on the
+          // ApprovalResolved broadcast, which the seq dedupe can drop and
+          // strand the card. A session-gone 404 (different body) is a real
+          // failure and surfaces an error. See #1821.
+          dispatch({ kind: "approval_resolved_locally", nonce });
         } else {
-          dispatch({ kind: "clear_error" });
+          dispatch({ kind: "error", message: outcome.message });
         }
       } catch (e) {
         dispatch({
