@@ -119,6 +119,20 @@ jobs:
       - name: Check skill file references valid CLI commands
         run: cargo xtask check-skill
 
+  build-cache-selftest:
+    name: Build Cache Self-Test
+    runs-on: ubuntu-latest
+    # Guards the zero-copy threshold checker that the kache verify script
+    # relies on (scripts/verify-shared-target.sh). No cargo, no kache, no
+    # toolchain: feeds a known reflinked report and a known all-copies report
+    # through the checker and asserts it accepts the first and rejects the
+    # second. Runs in seconds.
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: scripts/verify-shared-target.sh --self-test
+
   nix:
     name: Nix Eval
     runs-on: ubuntu-latest

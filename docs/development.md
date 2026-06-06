@@ -12,6 +12,89 @@ The release binary is at `target/release/aoe`.
 
 The web dashboard needs the `serve` feature and Node.js: `cargo build --release --features serve`. See [Web Dashboard Development](development/web-dashboard.md).
 
+## Faster rebuilds across worktrees (kache)
+
+AoE's normal workflow keeps several git worktrees in flight at once (one per
+branch). Each worktree has its own `target/`, so a cold `cargo build` in a fresh
+worktree recompiles all ~400 dependency crates from scratch, even when
+`Cargo.lock` is identical to a worktree that built them minutes ago. That is
+both slow (minutes of dependency compilation) and wasteful on disk (each
+`target/` holds its own multi-gigabyte copy of the same artifacts).
+
+[kache](https://github.com/kunobi-ninja/kache) is an optional, opt-in fix for
+this. It is a content-addressed rustc wrapper: it compiles each crate once,
+stores the artifact in a shared local store (`~/Library/Caches/kache` on macOS,
+`~/.cache/kache` on Linux), and **shares it into each worktree's `target/`
+without copying** by reflinking it (a copy-on-write clone, on APFS/btrfs/xfs) or
+hardlinking it (on filesystems without reflink support, such as ext4). The first
+build of a given `Cargo.lock` populates the store; every later build, in any
+worktree, restores the dependency artifacts instead of recompiling them. Each
+worktree still produces its own `target/debug/aoe` binary, and the shared blocks
+mean one physical copy of each dependency artifact backs all worktrees, so both
+build time and disk usage drop.
+
+kache is **not** required and is deliberately **not** committed to the repo (no
+`rustc-wrapper` in `.cargo/config.toml`): a plain `cargo build` with no extra
+setup works exactly as it does today, and CI, the Nix build, and release builds
+never touch kache, so shipped release binaries stay compiled by plain `rustc`.
+Each developer turns it on for themselves with two environment variables.
+
+### Opting in
+
+Install a prebuilt binary (the prebuilt avoids compiling kache; see the
+bootstrap caveat below):
+
+```bash
+cargo binstall kache         # prebuilt binary, recommended
+# or
+mise use -g github:kunobi-ninja/kache@latest
+```
+
+Enable it for your shell (for example in `~/.zshrc` or `~/.bashrc`):
+
+```bash
+export RUSTC_WRAPPER=kache
+export CARGO_INCREMENTAL=0   # kache and incremental compilation are mutually exclusive
+```
+
+Then build as usual; `rustc` now routes through kache and your per-worktree
+`target/debug/aoe` is unchanged:
+
+```bash
+cargo build --all-features
+```
+
+Watch cache hits and deduplicated bytes live with `kache monitor`, or print a
+non-interactive summary with `kache stats`. To go back to plain `rustc`, unset
+`RUSTC_WRAPPER` (or point it at another wrapper, e.g. `export
+RUSTC_WRAPPER=sccache` for a time-only cache without disk dedup).
+
+### Caveats
+
+- **Same filesystem only.** Reflinks and hardlinks cannot span filesystems, so
+  the kache store and your worktrees' `target/` dirs must live on one volume. A
+  worktree on a different mount falls back to copying (still cached, no disk
+  dedup).
+- **Native-linking crates still rebuild.** Dependencies with build scripts that
+  link C libraries (`git2`, `openssl-sys`, `ring`) are not cacheable and
+  recompile each time. They are a minority of total build time.
+- **`--features serve` and stale assets.** The web dashboard embeds `web/dist`
+  at compile time via `rust-embed` (the `debug-embed` feature embeds in debug
+  builds too). `build.rs` emits `rerun-if-changed=web/src` (and the other web
+  inputs), so rebuilding the frontend dirties the crate and kache recompiles it;
+  a cache hit therefore should not serve stale embedded assets. If you ever
+  suspect a stale bundle, `cargo clean -p agent-of-empires` forces a rebuild.
+- **macOS:** kache excludes its store from Spotlight indexing and Time Machine
+  automatically.
+- **Bootstrap.** Prefer the prebuilt install above. If you do build kache from
+  source with `cargo install` while `RUSTC_WRAPPER=kache` is already exported,
+  cargo tries to use kache to compile kache and fails; unset the variable for
+  that one command.
+
+You can confirm the dependency artifacts are actually shared and deduplicated
+across two target dirs with `scripts/verify-shared-target.sh` (see the script
+header for usage).
+
 ## Running
 
 ```bash
