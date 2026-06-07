@@ -89,6 +89,12 @@ pub struct SessionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snoozed_until: Option<String>,
     pub has_managed_worktree: bool,
+    /// Whether renaming this session also moves its worktree directory (the
+    /// resolved `session.tie_workdir_to_name` for an aoe-managed worktree).
+    /// Populated by `list_sessions` from the per-profile config; single-session
+    /// responses leave it `false` and the sidebar reads the list value. #1927.
+    #[serde(default)]
+    pub tie_workdir_to_name: bool,
     pub has_terminal: bool,
     pub profile: String,
     pub cleanup_defaults: CleanupDefaults,
@@ -256,6 +262,8 @@ impl SessionResponse {
                 .worktree_info
                 .as_ref()
                 .is_some_and(|w| w.managed_by_aoe),
+            // Overlaid per-profile in list_sessions; see the field doc.
+            tie_workdir_to_name: false,
             has_terminal: inst.terminal_info.is_some(),
             profile: inst.source_profile.clone(),
             cleanup_defaults: CleanupDefaults {
@@ -472,6 +480,25 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
         fresh
     };
 
+    // Overlay the per-profile tie setting (#1927) so the sidebar can collapse
+    // the standalone workdir action for tied worktree sessions. Resolved once
+    // per distinct profile, not per session.
+    {
+        use std::collections::HashMap;
+        let mut tie_cache: HashMap<String, bool> = HashMap::new();
+        for session in &mut sessions {
+            if !session.has_managed_worktree {
+                continue;
+            }
+            let tied = *tie_cache.entry(session.profile.clone()).or_insert_with(|| {
+                crate::session::profile_config::resolve_config_or_warn(&session.profile)
+                    .session
+                    .tie_workdir_to_name
+            });
+            session.tie_workdir_to_name = tied;
+        }
+    }
+
     // Resolve remote owners with a permanent cache on AppState
     {
         let cache = state.remote_owner_cache.read().await;
@@ -686,6 +713,12 @@ pub async fn update_workspace_ordering(
 #[derive(Deserialize)]
 pub struct RenameSessionBody {
     pub title: String,
+    /// When the session is tied (`session.tie_workdir_to_name`) and an
+    /// aoe-managed worktree, also rename the underlying git branch to match
+    /// the new title. Off by default; ignored for untied / non-worktree
+    /// sessions. See #1927.
+    #[serde(default)]
+    pub rename_branch: bool,
 }
 
 fn apply_session_title_rename(inst: &mut Instance, title: String) {
@@ -726,44 +759,160 @@ pub async fn rename_session(
             .into_response();
     }
 
-    let mut instances = state.instances.write().await;
-    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "message": "Session not found" })),
+    // Serialize against other mutations on this session (start, delete,
+    // worktree edit) so the tied git move and the metadata write don't race.
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let (worktree_info, current_path, status, profile) = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        (
+            inst.worktree_info.clone(),
+            inst.project_path.clone(),
+            inst.status,
+            inst.source_profile.clone(),
         )
-            .into_response();
     };
 
-    apply_session_title_rename(inst, title.clone());
+    // Tied mode (#1927): renaming an aoe-managed worktree session also moves
+    // its directory leaf to match the title, so title and dir cannot drift.
+    let tied = crate::session::profile_config::resolve_config_or_warn(&profile)
+        .session
+        .tie_workdir_to_name
+        && worktree_info.as_ref().is_some_and(|w| w.managed_by_aoe);
 
-    let response =
-        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
-    let profile = inst.source_profile.clone();
-    drop(instances);
+    // What to write to disk + memory once any git side effect has landed.
+    let mut new_path: Option<String> = None;
+    let mut new_branch: Option<String> = None;
 
-    if let Ok(storage) = Storage::new(&profile) {
-        let title_clone = title.clone();
-        let id_clone = id.clone();
-        match tokio::task::spawn_blocking(move || {
-            storage.update(|instances, _groups| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
-                    apply_session_title_rename(inst, title_clone);
-                }
-                Ok(())
-            })
+    if tied {
+        // The dir move is gated on a quiescent worktree, exactly like the
+        // standalone worktree-name edit. A running session must be stopped
+        // first; the setting is the escape hatch for free-form relabeling.
+        if status.blocks_worktree_edit() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "session_running",
+                    "message": "Stop the session before renaming it: its worktree directory moves to match the new name. Disable \"Tie Worktree Directory to Session Name\" to relabel a running session."
+                })),
+            )
+                .into_response();
+        }
+
+        let wt = worktree_info.expect("tied implies worktree_info is Some");
+        let cur = current_path.clone();
+        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&title);
+        let rename_branch = body.rename_branch;
+        let edit = tokio::task::spawn_blocking(move || {
+            crate::session::worktree_edit::edit_worktree_workdir(
+                crate::session::worktree_edit::WorktreeEditRequest {
+                    worktree_info: &wt,
+                    current_path: std::path::Path::new(&cur),
+                    new_name: &leaf,
+                    rename_branch,
+                },
+            )
+            .map(|o| (o.new_path.to_string_lossy().to_string(), o.new_branch))
         })
-        .await
-        {
-            Ok(Ok(())) => {}
+        .await;
+
+        match edit {
+            Ok(Ok((path, branch))) => {
+                new_path = Some(path);
+                new_branch = branch;
+            }
+            // The title slug maps to the current leaf and no branch rename was
+            // requested: nothing to move, fall through to a plain title rename.
+            Ok(Err(crate::session::worktree_edit::WorktreeEditError::Unchanged)) => {}
             Ok(Err(e)) => {
-                tracing::error!(target: "http.api.sessions", "Failed to save after rename: {e}")
+                tracing::warn!(target: "http.api.sessions", session = %id, "tied rename worktree edit failed: {e}");
+                let (code, msg) = worktree_edit_error_response(&e);
+                return (code, Json(serde_json::json!({ "message": msg }))).into_response();
             }
             Err(e) => {
-                tracing::error!(target: "http.api.sessions", "Rename persist join failed: {e}")
+                tracing::error!(target: "http.api.sessions", "tied rename worktree edit join failed: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "message": "Worktree edit task failed" })),
+                )
+                    .into_response();
             }
         }
     }
+
+    // Persist BEFORE mutating in-memory state: when a git move has landed, a
+    // silent persist failure would otherwise leave metadata pointing at the
+    // old path after a daemon restart, so it returns 500 rather than a
+    // misleading 200.
+    let persisted = {
+        let storage = Storage::new(&profile);
+        let title_clone = title.clone();
+        let id_clone = id.clone();
+        let new_path_clone = new_path.clone();
+        let new_branch_clone = new_branch.clone();
+        match storage {
+            Ok(storage) => tokio::task::spawn_blocking(move || {
+                storage.update(|instances, _groups| {
+                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
+                        if let Some(path) = new_path_clone.as_deref() {
+                            apply_worktree_name_edit(inst, path, new_branch_clone.as_deref());
+                        }
+                        apply_session_title_rename(inst, title_clone);
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string())),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    if let Err(e) = persisted {
+        tracing::error!(target: "http.api.sessions", session = %id, "Failed to save after rename: {e}");
+        // Persist-first: never fall through to mutate in-memory state on a
+        // failed write, or the rename silently reverts on restart. When a dir
+        // move already landed, say so; otherwise it is a plain title persist.
+        let message = if new_path.is_some() {
+            "Worktree was moved on disk, but persisting the new session metadata failed"
+        } else {
+            "Persisting the renamed session failed"
+        };
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "persist_failed", "message": message })),
+        )
+            .into_response();
+    }
+
+    let mut response = {
+        let mut instances = state.instances.write().await;
+        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        if let Some(path) = new_path.as_deref() {
+            apply_worktree_name_edit(inst, path, new_branch.as_deref());
+        }
+        apply_session_title_rename(inst, title.clone());
+        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen())
+    };
+    // Single-session responses are not run through list_sessions' overlay, so
+    // carry the resolved tie value here too (#1927); otherwise a client that
+    // trusts the mutation response would see a managed worktree claim it is
+    // untied until the next list refresh.
+    response.tie_workdir_to_name = tied;
 
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
@@ -889,6 +1038,23 @@ pub async fn set_worktree_name(
         )
             .into_response();
     };
+    // When tied (#1927), the directory is not edited independently: it follows
+    // the title. Reject the standalone edit so no client can drift the two
+    // apart, pointing callers at the unified rename.
+    if worktree_info.managed_by_aoe
+        && crate::session::profile_config::resolve_config_or_warn(&profile)
+            .session
+            .tie_workdir_to_name
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "tied",
+                "message": "Renaming is unified while \"Tie Worktree Directory to Session Name\" is on; rename the session instead, and its directory follows."
+            })),
+        )
+            .into_response();
+    }
     if status.blocks_worktree_edit() {
         return (
             StatusCode::CONFLICT,
@@ -2497,6 +2663,16 @@ pub async fn create_session(
                 crate::claude_settings::read_tui_fullscreen(),
             );
             resp.warnings = warnings;
+            // Carry the resolved tie value (#1927); list_sessions' overlay does
+            // not run on this create response, so a managed worktree would
+            // otherwise report untied until the next list refresh.
+            if resp.has_managed_worktree {
+                resp.tie_workdir_to_name = crate::session::profile_config::resolve_config_or_warn(
+                    &instance.source_profile,
+                )
+                .session
+                .tie_workdir_to_name;
+            }
             if !resp.acp_capable {
                 let acp_cmd = crate::session::repo_config::resolve_config_with_repo_or_warn(
                     &instance.source_profile,
@@ -5067,6 +5243,7 @@ mod workspace_ordering_tests {
             is_sandboxed: false,
             scratch: false,
             has_managed_worktree: false,
+            tie_workdir_to_name: false,
             has_terminal: false,
             profile: "default".to_string(),
             cleanup_defaults: CleanupDefaults {
