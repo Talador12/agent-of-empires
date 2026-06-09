@@ -3300,11 +3300,15 @@ impl HomeView {
         let size = crate::terminal::get_size();
         // Same pane-readiness cascades as live-send: agent runs the
         // full `ensure_pane_ready` (Docker, splash, resume); terminals
-        // just need their tmux session to exist with a live pane.
+        // just need their tmux session to exist with a live pane. Seed a
+        // cold/dead agent pane at the terminal size for the same reason
+        // live-send does (see `ensure_pane_ready_with_size`): otherwise it
+        // boots at tmux's 80x24 default and runs narrow until something
+        // resizes it.
         let stale_sid = match target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
-                    inst.ensure_pane_ready().map_err(Into::into)
+                    inst.ensure_pane_ready_with_size(size).map_err(Into::into)
                 });
                 match outcome {
                     Ok(Some(EnsureReadyOutcome::Respawned {
@@ -3390,6 +3394,25 @@ impl HomeView {
         stale_sid
     }
 
+    /// Size to boot a cold/dead agent pane at on live-send entry: the visible
+    /// preview output rect when known, else the full terminal. `preview_pane_area`
+    /// is the exact rect `finalize_live_send_resize` resizes to, so seeding the
+    /// boot here makes the post-boot resize a no-op for cold starts (no reflow,
+    /// no SIGWINCH race). Falls back to the terminal size for the rare entry
+    /// with no prior preview frame (e.g. attach-on-create), and to `None` if
+    /// neither is available so tmux keeps its default.
+    fn live_send_boot_size(&self) -> Option<(u16, u16)> {
+        let pane = self.preview_pane_area;
+        if pane.width > 0 && pane.height > 0 {
+            Some((pane.width, pane.height))
+        } else {
+            // A zero-dimension terminal size is as unusable as no size at all;
+            // drop it so the start path keeps tmux's default instead of being
+            // handed `-x 0`/`-y 0`.
+            crate::terminal::get_size().filter(|(cols, rows)| *cols > 0 && *rows > 0)
+        }
+    }
+
     /// Stage live-send mode against `session_id`. Mirrors
     /// `execute_send_message`'s revive cascade so a cold-start (Docker
     /// pull, agent splash) is handled before the user starts typing,
@@ -3420,10 +3443,19 @@ impl HomeView {
         // targets are simpler: the paired terminal is a plain shell,
         // so we just ensure the tmux session exists and re-spawn it if
         // the pane has died (matches `attach_terminal`).
+        //
+        // Boot the agent at the size it will be shown at, not tmux's 80x24
+        // default. A cold-started agent that boots narrow relies on
+        // `finalize_live_send_resize`'s single post-boot SIGWINCH to grow into
+        // the live area, a resize that races the agent's startup and, when
+        // lost, leaves the pane pinned at ~50% width until live mode is
+        // re-entered. See `Instance::ensure_pane_ready_with_size`.
+        let agent_boot_size = self.live_send_boot_size();
         let stale_sid = match target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
-                    inst.ensure_pane_ready().map_err(Into::into)
+                    inst.ensure_pane_ready_with_size(agent_boot_size)
+                        .map_err(Into::into)
                 });
                 match outcome {
                     Ok(Some(EnsureReadyOutcome::Respawned {
