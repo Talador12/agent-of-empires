@@ -205,6 +205,8 @@ function AcpChrome({
   dismissModeSwitchFailed,
   setConfigOption,
   dismissConfigOptionSwitchFailed,
+  canLoadEarlierHistory,
+  loadEarlierHistory,
 }: AcpContext & {
   sessionId: string;
   acpWorkerState: "absent" | "resuming" | "running";
@@ -393,6 +395,19 @@ function AcpChrome({
                 expanded={showClearedTurns}
                 onToggle={onToggleClearedTurns}
               />
+            )}
+
+            {canLoadEarlierHistory && (
+              <div className="mb-3 flex justify-center">
+                <button
+                  type="button"
+                  onClick={loadEarlierHistory}
+                  data-testid="acp-load-earlier"
+                  className="h-8 rounded-md border border-surface-700 bg-surface-800 px-3 text-xs text-text-secondary hover:bg-surface-700 hover:text-text-primary transition-colors cursor-pointer"
+                >
+                  Load earlier messages
+                </button>
+              </div>
             )}
 
             <ThreadPrimitive.Messages

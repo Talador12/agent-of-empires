@@ -66,7 +66,6 @@ aoe add . --agent aoe-agent --model gpt-5   # pick an ACP agent + model (implies
 ```
 
 `--agent` for an uninstalled adapter errors with an install hint; `--structured-view` (no `--agent`) falls back to the terminal view with a warning so the command still succeeds.
-
 ## Requirements
 
 - aoe built with `--features serve`.
