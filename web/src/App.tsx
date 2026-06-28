@@ -17,6 +17,7 @@ import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
 import { PluginUiProvider, usePluginUiEntries } from "./lib/pluginUiContext";
 import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
 import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
+import { workspaceIsTrashed } from "./lib/sidebarSort";
 import { useSidebarSortMode } from "./hooks/useSidebarSortMode";
 import { useSidebarAxis } from "./hooks/useSidebarAxis";
 import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
@@ -39,11 +40,10 @@ import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab } from "./lib/
 import { isPluginPaneId, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginSlots";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
-import { restoreSessions, trashSessions } from "./lib/trashActions";
+import { deleteWorkspaceSessions, restoreSessions, trashSessions } from "./lib/trashActions";
 import {
   loginStatus,
   logout,
-  deleteSession,
   stopSession,
   startSession,
   fetchAbout,
@@ -275,6 +275,12 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     applySession,
   } = useSessions();
   const workspaces = useWorkspaces(sessions);
+  // Trash is a whole-workspace concern, so it is derived here from the
+  // authoritative unsliced workspace list rather than reconstructed from the
+  // sidebar's per-`group_path` slice views. A workspace is in Trash only when
+  // every one of its sessions is trashed, and Restore/Delete then cover all of
+  // them. See #2533.
+  const trashedWorkspaces = useMemo(() => workspaces.filter(workspaceIsTrashed), [workspaces]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103).
   useLastSessionRestore({ activeSessionId, sessions, sessionsLoaded });
@@ -847,45 +853,26 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   const handleConfirmDelete = useCallback(
     async (options: DeleteSessionOptions) => {
-      if (!deletingSession) return;
-      const sessionId = deletingSession.id;
-      const wasActive = sessionId === activeSessionId;
-
-      // Close dialog and show "Deleting" status immediately
+      if (!deletingWorkspace) return;
+      const sessions = deletingWorkspace.sessions;
+      // Close the dialog immediately; the loop, ordering, and toast logic live
+      // in deleteWorkspaceSessions so they are unit-testable without the bundle.
       setDeletingWorkspaceId(null);
-      setSessionStatus(sessionId, "Deleting");
-
-      if (wasActive) {
-        navigate("/");
-      }
-
-      const result = await deleteSession(sessionId, options);
-      if (!result.ok) {
-        // Revert status on failure
-        setSessionStatus(sessionId, "Error");
-        toastBus.handler?.error(result.error || "Failed to delete session");
-        return;
-      }
-
-      // Drop the per-session acp cache so a recreated session with
-      // the same id doesn't briefly show the prior transcript on
-      // remount before fetchReplay clears it.
-      clearAcpCache(sessionId);
-      // Drop the persisted composer draft for the deleted session so its
-      // localStorage key doesn't linger (#1358). Cross-tab / cross-device
-      // deletes go through the startup sweep instead.
-      clearDraft(sessionId);
-      // Same hygiene for persisted diff-comments storage (#1842); cross-tab /
-      // cross-device deletes still fall to the startup sweep.
-      clearStoredComments(sessionId);
-
-      // Server returns `messages` from `perform_deletion` when there's something
-      // user-facing to report (e.g. "Scratch directory kept at: <path>" when
-      // `keep_scratch` is set). Surface the first one so the kept-path is visible.
-      const toast = result.messages?.[0] ?? "Session deleted";
-      toastBus.handler?.info(toast);
+      await deleteWorkspaceSessions(sessions, options, activeSessionId, {
+        setStatus: setSessionStatus,
+        // Drop a deleted session's local-only state (#1358 acp cache + draft,
+        // #1842 diff comments). Cross-tab / cross-device deletes fall to the
+        // startup sweep.
+        purgeLocal: (id) => {
+          clearAcpCache(id);
+          clearDraft(id);
+          clearStoredComments(id);
+        },
+        navigateHome: () => navigate("/"),
+        notify: toastBus.handler,
+      });
     },
-    [deletingSession, activeSessionId, setSessionStatus, navigate],
+    [deletingWorkspace, activeSessionId, setSessionStatus, navigate],
   );
 
   // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
@@ -1770,6 +1757,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             <WorkspaceSidebar
               groups={sidebarGroups}
               nestedGroups={nestedGroups}
+              trashedWorkspaces={trashedWorkspaces}
               onToggleSubgroup={toggleSubgroupCollapsed}
               onReorderWorkspaces={handleReorderWorkspaces}
               onReorderGroups={reorderRepoGroups}
@@ -1864,6 +1852,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             isScratch={deletingSession.scratch}
             cleanupDefaults={deletingSession.cleanup_defaults}
             defaultToTrash={!deletingSession.trashed_at && deletingSession.cleanup_defaults.delete_to_trash}
+            extraSessionCount={deletingWorkspace ? deletingWorkspace.sessions.length - 1 : 0}
             onConfirm={handleConfirmDelete}
             onTrash={handleConfirmTrash}
             onCancel={() => setDeletingWorkspaceId(null)}
