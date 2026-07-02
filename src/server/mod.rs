@@ -4004,15 +4004,38 @@ fn apply_acp_session_change(
                 "persisting agent-assigned ACP session id"
             );
             inst.acp_session_id = Some(new_id.clone());
+            // A structured fork sets fork_pending + import_pending together at
+            // creation and does not pre-pin acp_session_id, so the adapter's
+            // new forked id arrives on THIS different-id path. Consume both
+            // one-shot markers together: a restart resumes the child via
+            // session/load instead of re-forking the parent, and leaving
+            // import_pending set would make that resume re-seed the transcript
+            // into an already-populated store (duplicate-key corruption, the
+            // #2276 class). Gate the import clear on fork_pending having been
+            // set, so a non-fork different-id assignment leaves import_pending
+            // alone for its own retry.
+            if inst.fork_pending.take().is_some() {
+                inst.import_pending = None;
+            }
         }
         AcpSessionChange::Reset(reason) => {
             tracing::info!(
                 target: "acp.event_listener",
                 session = %session_id,
                 %reason,
-                "clearing stored ACP session id after session/load failure"
+                "clearing stored ACP session id after a context reset (session/load or session/fork failure)"
             );
             inst.acp_session_id = None;
+            // A structured fork that failed (or was refused by a resume-only
+            // agent) reaches here via SessionContextReset. Clear the one-shot
+            // fork marker so the reconciler stops re-issuing the same failing
+            // `session/fork` on every reattach, and drop the paired
+            // import_pending the same way the success path does so the fallback
+            // spawn is a clean session/new. A session/load-failure reset has no
+            // fork pending, so this is a no-op there.
+            if inst.fork_pending.take().is_some() {
+                inst.import_pending = None;
+            }
         }
     }
     Some(inst.source_profile.clone())
@@ -4306,6 +4329,130 @@ mod tests {
             persist.is_some(),
             "clearing a stale marker must trigger a persist even on an unchanged id"
         );
+    }
+
+    // A structured fork mints a brand-new child id on its first session/fork,
+    // so the assigned id differs from the (None) acp_session_id and we take the
+    // new-assignment path. That path must consume the one-shot fork_pending seed
+    // and persist, so a restart resumes the child via session/load rather than
+    // re-forking the parent.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn assigning_forked_id_clears_fork_pending_and_persists() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
+        inst.acp_session_id = None;
+        inst.fork_pending = Some("parent-acp-id".into());
+        inst.import_pending = Some(true);
+
+        let profile = apply_acp_session_change(
+            &mut inst,
+            "sess-1",
+            Some(&AcpSessionChange::Assigned("forked-child-id".into())),
+        );
+
+        assert_eq!(inst.acp_session_id.as_deref(), Some("forked-child-id"));
+        assert_eq!(
+            inst.fork_pending, None,
+            "fork_pending cleared once the forked id is assigned"
+        );
+        assert_eq!(
+            inst.import_pending, None,
+            "import_pending consumed alongside fork_pending so a restart does not re-seed the transcript into the forked store"
+        );
+        assert!(
+            profile.is_some(),
+            "must persist so the forked id survives restart"
+        );
+    }
+
+    // A different-id assignment that is NOT consuming a fork (fork_pending is
+    // None) must leave import_pending alone: that marker belongs to the import
+    // flow, which lands on the same-id path, and clearing it here would block a
+    // legitimate import retry from re-seeding the transcript.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn non_fork_assignment_preserves_import_pending() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.acp_session_id = None;
+        inst.fork_pending = None;
+        inst.import_pending = Some(true);
+
+        let profile = apply_acp_session_change(
+            &mut inst,
+            "sess-1",
+            Some(&AcpSessionChange::Assigned("some-new-id".into())),
+        );
+
+        assert_eq!(inst.acp_session_id.as_deref(), Some("some-new-id"));
+        assert_eq!(
+            inst.import_pending,
+            Some(true),
+            "a non-fork different-id assignment must not consume import_pending"
+        );
+        assert!(
+            profile.is_some(),
+            "a new id assignment must persist regardless of markers"
+        );
+    }
+
+    // A SessionContextReset from a FAILED structured fork must clear the
+    // one-shot fork marker (and its paired import marker) so neither the
+    // reconciler nor the supervisor re-issues the same failing session/fork on
+    // the next reattach. This is the reducer side of the fork-failure retry-loop
+    // fix; the reset carries no new id, so acp_session_id is cleared too.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn reset_clears_fork_pending_and_import_pending() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
+        inst.acp_session_id = Some("stale-parent-id".into());
+        inst.fork_pending = Some("parent-acp-id".into());
+        inst.import_pending = Some(true);
+
+        let profile = apply_acp_session_change(
+            &mut inst,
+            "sess-1",
+            Some(&AcpSessionChange::Reset("fork_failed: boom".into())),
+        );
+
+        assert_eq!(inst.acp_session_id, None, "reset clears the stored id");
+        assert_eq!(
+            inst.fork_pending, None,
+            "a failed fork's one-shot marker must clear so it is not retried"
+        );
+        assert_eq!(
+            inst.import_pending, None,
+            "import_pending is consumed alongside fork_pending on reset"
+        );
+        assert!(profile.is_some(), "the reset must persist");
+    }
+
+    // A SessionContextReset from a plain session/load failure (no fork pending)
+    // must clear the dead id but leave import_pending untouched: that marker
+    // belongs to the import flow, and clearing it here would block a legitimate
+    // import retry. Mirrors the non-fork assignment guard.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn reset_without_fork_pending_preserves_import_pending() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.acp_session_id = Some("dead-id".into());
+        inst.fork_pending = None;
+        inst.import_pending = Some(true);
+
+        let profile = apply_acp_session_change(
+            &mut inst,
+            "sess-1",
+            Some(&AcpSessionChange::Reset("session/load failed: gone".into())),
+        );
+
+        assert_eq!(inst.acp_session_id, None, "reset clears the dead id");
+        assert_eq!(
+            inst.import_pending,
+            Some(true),
+            "a non-fork reset must not consume import_pending"
+        );
+        assert!(profile.is_some(), "the reset must persist");
     }
 
     #[cfg(feature = "serve")]

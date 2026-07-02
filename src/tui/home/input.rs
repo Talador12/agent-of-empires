@@ -2581,6 +2581,7 @@ impl HomeView {
             ActionId::ToggleProjectPin => self.toggle_project_pin_at_cursor(),
             ActionId::NextWaiting => self.jump_to_next_waiting(),
             ActionId::Tips => self.open_tips_dialog(),
+            ActionId::Fork => self.open_fork_from_selection(),
         }
         None
     }
@@ -2661,6 +2662,174 @@ impl HomeView {
             // that teaches it.
             self.record_used_new_from_selection();
         }
+    }
+
+    /// Whether the session `id` can be forked, so the context menu shows the
+    /// "Fork session" row only when the palette action would succeed. A
+    /// structured parent needs an agent advertising the ACP fork capability; a
+    /// terminal parent needs a forkable terminal agent (claude/codex/opencode).
+    /// The captured-conversation precondition is intentionally NOT checked here:
+    /// the row still shows for a not-yet-started session, and the palette action
+    /// explains "nothing to fork yet" if the user picks it, matching how other
+    /// rows stay visible and explain on use.
+    pub(super) fn session_can_fork(&self, id: &str) -> bool {
+        let Some(inst) = self.get_instance(id) else {
+            return false;
+        };
+        if inst.is_structured() {
+            #[cfg(feature = "serve")]
+            {
+                crate::session::fork::structured_fork_capable(
+                    &inst.tool,
+                    inst.agent_name.as_deref(),
+                )
+            }
+            #[cfg(not(feature = "serve"))]
+            {
+                false
+            }
+        } else {
+            crate::session::fork::terminal_agent_can_fork(&inst.tool)
+        }
+    }
+
+    /// Open the new-session dialog seeded as a fork of the selected session.
+    /// The forked session resumes the parent's captured conversation in a fresh
+    /// independent session id, so it can diverge without disturbing the parent.
+    /// Inherits the parent's repo path and group like "new from selection";
+    /// refuses (with an explanatory info dialog) when the agent can't fork or
+    /// the parent has no captured conversation yet.
+    pub(super) fn open_fork_from_selection(&mut self) {
+        if self.creating_stub_id.is_some() {
+            self.info_dialog = Some(InfoDialog::new(
+                "Please Wait",
+                "A session is already being created. Wait for it to finish or press Ctrl+C to cancel.",
+            ));
+            return;
+        }
+        if !self.available_tools.any_available() {
+            self.show_no_agents();
+            return;
+        }
+
+        // Pull the few parent fields we need into owned locals so the
+        // immutable borrow of `self` is dropped before the mutable `self.`
+        // calls below (dialog construction, info_dialog assignment). A
+        // structured (ACP) parent forks structured, so its captured ACP
+        // session id rides along; the field only exists under `serve`.
+        let Some(parent) = self
+            .selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id))
+        else {
+            return;
+        };
+        let tool = parent.tool.clone();
+        let parent_agent_session_id = parent.agent_session_id.clone();
+        let repo_path = parent.repo_path().to_string();
+        let group_path = parent.group_path.clone();
+        let title = parent.title.clone();
+        let parent_is_structured = parent.is_structured();
+        #[cfg(feature = "serve")]
+        let parent_agent_name = parent.agent_name.clone();
+        #[cfg(feature = "serve")]
+        let parent_acp_session_id = parent.acp_session_id.clone();
+
+        let seed = if parent_is_structured {
+            // A structured parent forks via the ACP `session/fork` handshake,
+            // not the terminal resume-with-fork-flag path. The captured ACP
+            // session id is the parent to fork from; without one there is no
+            // conversation to fork yet.
+            #[cfg(feature = "serve")]
+            {
+                // Gate on the same predicate the REST create-guard and the web
+                // `acp_can_fork` projection use: a resume-only ACP agent (e.g.
+                // `aoe-agent`) has no fork strategy, so `session/fork` would be
+                // refused at the handshake and silently downgrade to
+                // `session/new`, handing the user an empty session they think is
+                // a fork. Refuse up front with the same info dialog terminal
+                // denial uses.
+                if !crate::session::fork::structured_fork_capable(
+                    &tool,
+                    parent_agent_name.as_deref(),
+                ) {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Fork not supported",
+                        &format!(
+                            "The '{}' agent cannot fork a structured session. Fork is available for agents that support the ACP fork capability, such as Claude.",
+                            tool
+                        ),
+                    ));
+                    return;
+                }
+                let Some(acp_id) = parent_acp_session_id.filter(|s| !s.is_empty()) else {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Nothing to fork yet",
+                        "This session has no captured conversation to fork from. Send it at least one message first.",
+                    ));
+                    return;
+                };
+                crate::session::ForkSeed::Structured {
+                    parent_acp_session_id: acp_id,
+                }
+            }
+            // Without `serve` a session can never be structured (the field
+            // doesn't exist and `is_structured()` is hard-coded false), so this
+            // branch is unreachable; keep the compiler happy on bare-core.
+            #[cfg(not(feature = "serve"))]
+            unreachable!("is_structured() is always false without the serve feature")
+        } else {
+            let child_id = crate::session::capture::generate_claude_session_id();
+            match crate::session::fork::terminal_fork_seed(
+                &tool,
+                parent_agent_session_id.as_deref(),
+                child_id,
+            ) {
+                Ok(s) => s,
+                Err(crate::session::ForkDenied::AgentCannotFork) => {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Fork not supported",
+                        &format!(
+                            "The '{}' agent cannot fork a session. Fork is available for Claude, Codex, and OpenCode.",
+                            tool
+                        ),
+                    ));
+                    return;
+                }
+                Err(crate::session::ForkDenied::NoParentSession) => {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Nothing to fork yet",
+                        "This session has no captured conversation to fork from. Send it at least one message first.",
+                    ));
+                    return;
+                }
+            }
+        };
+
+        let existing_groups: Vec<String> =
+            self.all_groups().iter().map(|g| g.path.clone()).collect();
+        let current_profile = self
+            .profile_for_cursor(self.cursor)
+            .unwrap_or_else(|| self.config_profile());
+        let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
+        let mut dialog = NewSessionDialog::new(
+            self.available_tools.clone(),
+            existing_groups,
+            &current_profile,
+            profiles,
+        );
+        dialog.set_path(repo_path);
+        if !group_path.is_empty() {
+            dialog.set_group(group_path);
+        }
+        dialog.set_title(format!("{} (fork)", title));
+        // The seed forks the parent's agent, so the dialog must open on that
+        // same agent rather than the configured default; otherwise a Codex or
+        // OpenCode parent would land on claude and mismatch the seed.
+        dialog.set_tool(&tool);
+        dialog.set_fork_from(seed);
+        dialog.focus_title();
+        self.new_dialog = Some(dialog);
     }
 
     /// Pick a representative repo path for a selected group so "New Session"
@@ -3789,7 +3958,14 @@ impl HomeView {
                 // The unread toggle is always-on (any sort), so it shows
                 // whenever the feature is enabled.
                 let unread = crate::session::unread_enabled().then_some(is_unread);
-                ContextMenuDialog::for_session(anchor, is_archived, snooze, unread)
+                // Show "Fork session" only when the agent can actually fork, so
+                // a resume-only agent doesn't offer an action the palette would
+                // refuse. Matches the web sidebar's `acp_can_fork` gating.
+                let can_fork = match &self.flat_items[idx] {
+                    super::Item::Session { id, .. } => self.session_can_fork(id),
+                    super::Item::Group { .. } => false,
+                };
+                ContextMenuDialog::for_session(anchor, is_archived, snooze, unread, can_fork)
             });
             return true;
         }
@@ -3878,6 +4054,7 @@ impl HomeView {
             // path and group, a group/project row borrows a member's path, the
             // same way `'N'` does.
             ContextMenuAction::NewFromSelection => self.open_new_from_selection(),
+            ContextMenuAction::Fork => self.open_fork_from_selection(),
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),
             ContextMenuAction::TogglePin => {
@@ -5934,6 +6111,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             scratch: false,
+            fork_seed: None,
         }
     }
 

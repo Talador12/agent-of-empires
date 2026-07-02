@@ -245,6 +245,47 @@ function makeOpencodeModeOption(currentValue) {
   };
 }
 
+// The per-session selectors (model + effort, plus the synthetic OpenCode-shape
+// mode option when FAKE_ACP_MODE_VIA_CONFIG_OPTION is set) that ship in the
+// session/new, session/load, and session/fork *responses*. Shared so a forked
+// session hydrates the same selectors as a fresh one; returns undefined when
+// FAKE_ACP_EMIT_CONFIG_OPTIONS is "0" so the caller can omit the field.
+function buildSessionConfigOptions(sessionId) {
+  if (process.env.FAKE_ACP_EMIT_CONFIG_OPTIONS === "0") return undefined;
+  const configOptions = [
+    {
+      id: "model",
+      name: "Model",
+      category: "model",
+      type: "select",
+      currentValue: "claude-opus-4-7",
+      options: [
+        { value: "claude-opus-4-7", name: "Claude Opus 4.7" },
+        { value: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
+      ],
+    },
+    {
+      id: "effort",
+      name: "Reasoning Effort",
+      category: "thought_level",
+      type: "select",
+      currentValue: "default",
+      options: [
+        { value: "default", name: "Default" },
+        { value: "low", name: "Low" },
+        { value: "medium", name: "Medium" },
+        { value: "high", name: "High" },
+      ],
+    },
+  ];
+  if (process.env.FAKE_ACP_MODE_VIA_CONFIG_OPTION) {
+    const current = opencodeModeBySession.get(sessionId) ?? "build";
+    opencodeModeBySession.set(sessionId, current);
+    configOptions.push(makeOpencodeModeOption(current));
+  }
+  return configOptions;
+}
+
 async function emitSessionUpdates(sessionId, updates) {
   for (const u of updates) {
     if (cancelFlags.get(sessionId)) return;
@@ -334,6 +375,17 @@ const INITIALIZE_RESULT = {
   protocolVersion: 1,
   agentCapabilities: {
     loadSession: true,
+    // Advertise the unstable session lifecycle methods the real
+    // claude-agent-acp exposes. Only `fork` is consulted by aoe's structured
+    // fork gate (session_capabilities.fork.is_some()); the rest mirror the
+    // real shape so the fixture stays realistic.
+    sessionCapabilities: {
+      fork: {},
+      resume: {},
+      list: {},
+      close: {},
+      delete: {},
+    },
     promptCapabilities: {
       image: false,
       embeddedContext: false,
@@ -478,41 +530,9 @@ async function handleRequest(msg) {
       // session/new and session/load *response*, not as a subsequent
       // notification. The structured view's acp_client reads the response
       // field and emits Event::ConfigOptionsUpdated. See #1403.
-      const includeConfigOptions = process.env.FAKE_ACP_EMIT_CONFIG_OPTIONS !== "0";
       const result = { sessionId };
-      if (includeConfigOptions) {
-        result.configOptions = [
-          {
-            id: "model",
-            name: "Model",
-            category: "model",
-            type: "select",
-            currentValue: "claude-opus-4-7",
-            options: [
-              { value: "claude-opus-4-7", name: "Claude Opus 4.7" },
-              { value: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
-            ],
-          },
-          {
-            id: "effort",
-            name: "Reasoning Effort",
-            category: "thought_level",
-            type: "select",
-            currentValue: "default",
-            options: [
-              { value: "default", name: "Default" },
-              { value: "low", name: "Low" },
-              { value: "medium", name: "Medium" },
-              { value: "high", name: "High" },
-            ],
-          },
-        ];
-      }
-      if (process.env.FAKE_ACP_MODE_VIA_CONFIG_OPTION) {
-        const current = opencodeModeBySession.get(sessionId) ?? "build";
-        opencodeModeBySession.set(sessionId, current);
-        result.configOptions = [...(result.configOptions ?? []), makeOpencodeModeOption(current)];
-      }
+      const configOptions = buildSessionConfigOptions(sessionId);
+      if (configOptions) result.configOptions = configOptions;
       sendResult(id, result);
       // Test hook for the import flow (#2276): on session/load, replay a
       // deterministic transcript chunk the way claude-agent-acp re-emits
@@ -544,6 +564,32 @@ async function handleRequest(msg) {
           });
         });
       }
+      return;
+    }
+
+    case "session/fork": {
+      // Test hook: FAKE_ACP_FORK_FAIL makes the adapter reject session/fork the
+      // way a permanent agent-side failure would (parent GC'd, protocol error,
+      // build without fork). The Rust side must fail the spawn cleanly and
+      // clear fork_pending (no reconciler retry loop) rather than fall through
+      // to session/new. Mirrors the other failure knobs (e.g. RATE_LIMIT).
+      if (process.env.FAKE_ACP_FORK_FAIL) {
+        sendError(id, -32000, "fork failed: parent session not found");
+        return;
+      }
+      // Mirror claude-agent-acp's unstable_forkSession: mint a brand-new
+      // session id distinct from the parent (params.sessionId) rather than
+      // echoing it, and carry the same configOptions shape session/new ships
+      // so the structured view hydrates the forked session's selectors.
+      // Tag the forked id so the e2e can prove session/fork (not session/new)
+      // minted it: a plain new or structured session carries a "fake-acp-"
+      // id from makeSessionId(), so only a real session/fork yields the
+      // "fork-" marker.
+      const forkedId = `fake-acp-fork-${randomBytes(4).toString("hex")}`;
+      const result = { sessionId: forkedId };
+      const configOptions = buildSessionConfigOptions(forkedId);
+      if (configOptions) result.configOptions = configOptions;
+      sendResult(id, result);
       return;
     }
 

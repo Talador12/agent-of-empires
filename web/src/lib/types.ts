@@ -128,6 +128,20 @@ export interface SessionResponse {
    *  affordance reads this instead of a hardcoded tool list. Absent on
    *  builds without the acp feature. */
   acp_capable?: boolean;
+  /** The session's captured ACP session id, present only once the structured
+   *  view worker has minted one. The sidebar passes this as `fork_from` on a
+   *  structured fork create, and gates the "Fork" action on its presence (a
+   *  structured row with a captured id to diverge from). Absent for terminal
+   *  sessions and structured ones whose worker has not minted an id yet. */
+  acp_session_id?: string;
+  /** True when this session's agent can run a structured ACP `session/fork`:
+   *  it is ACP-capable AND declares a real fork strategy. Resume-only ACP
+   *  agents (e.g. the bundled `aoe-agent`, which advertises `loadSession` but
+   *  not `session/fork`) are ACP-capable yet not forkable. The sidebar gates the
+   *  "Fork" action on this together with `acp_session_id` so a resume-only row
+   *  never shows a dead-end fork button. Absent (read as not-forkable) for
+   *  terminal sessions and non-forkable agents. */
+  acp_can_fork?: boolean;
   /** True when this is a Claude Code session AND the user has enabled
    *  Claude's fullscreen renderer (`tui: "fullscreen"` in
    *  ~/.claude/settings.json). The mobile rendering path uses this to
@@ -495,6 +509,11 @@ export interface CreateSessionRequest {
    *  resume via `session/load`. Forces the structured view; `path` must be
    *  the session's original cwd. See #2276. */
   import_acp_session_id?: string;
+  /** Fork an existing session: the source session's captured agent session id
+   *  (terminal) or ACP session id (structured) to resume and diverge from. The
+   *  new session continues that conversation independently; the original is
+   *  untouched. Server picks terminal vs structured from `view` + tool. */
+  fork_from?: string;
 }
 
 /** A discoverable existing Claude Code session on disk, returned by

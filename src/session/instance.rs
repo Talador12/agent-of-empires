@@ -352,6 +352,12 @@ pub(crate) enum ResumeIntent {
     /// after the launch completes (one-shot semantics).
     #[serde(rename = "Cleared")]
     Cleared,
+    /// One-shot fork seed: on the next (first) launch, resume `from` and fork
+    /// into a NEW session whose id was pre-pinned in `agent_session_id`.
+    /// Auto-promotes to `Default` after that launch, exactly like `Cleared`,
+    /// so later restarts resume the child's own id with a plain `--resume`.
+    #[serde(rename = "Fork")]
+    Fork { from: String },
 }
 
 impl ResumeIntent {
@@ -637,6 +643,14 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub import_pending: Option<bool>,
 
+    /// One-shot structured-fork seed: the parent ACP session id to fork from
+    /// on first connect. Set at creation, consumed when the adapter assigns
+    /// the forked child id (see `apply_acp_session_change`). `None` for
+    /// non-fork sessions. Skipped in serialization when absent.
+    #[cfg(feature = "serve")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_pending: Option<String>,
+
     // Runtime state (not serialized)
     #[serde(skip)]
     pub last_error_check: Option<std::time::Instant>,
@@ -727,6 +741,61 @@ fn build_resume_flags(tool: &str, session_id: &str, is_existing_session: bool) -
     }
 }
 
+/// Build the launch flags for a one-shot terminal fork. Returns the empty
+/// string for an unforkable agent or an invalid id (mirroring
+/// `build_resume_flags`'s fail-closed contract). The child id is pre-pinned so
+/// the forked session is durable on disk before launch.
+fn build_fork_flags(tool: &str, parent_id: &str, child_id: &str) -> String {
+    use crate::agents::{get_agent, ForkStrategy, ResumeStrategy};
+
+    if !is_valid_session_id(parent_id) || !is_valid_session_id(child_id) {
+        tracing::warn!(target: "session.store",
+            "Refusing to build fork flags: invalid id (parent={parent_id:?} child={child_id:?})");
+        return String::new();
+    }
+    let Some(agent) = get_agent(tool) else {
+        return String::new();
+    };
+    match agent.fork_strategy {
+        ForkStrategy::ClaudeFork => {
+            format!("--resume {parent_id} --fork-session --session-id {child_id}")
+        }
+        ForkStrategy::CodexFork => {
+            // Codex mints its own forked id; child_id is unused. The subcommand
+            // is inserted after the binary by apply_session_flags.
+            format!("fork {parent_id}")
+        }
+        ForkStrategy::Flag(fork_flag) => {
+            // Resume the parent session (using the agent's own resume flag),
+            // then add the fork flag; the agent mints the new id.
+            match agent.resume_strategy {
+                ResumeStrategy::Flag(resume_flag) => {
+                    format!("{resume_flag} {parent_id} {fork_flag}")
+                }
+                _ => String::new(),
+            }
+        }
+        ForkStrategy::Unsupported => String::new(),
+    }
+}
+
+/// Splice `part` into `cmd`: insert it right after the binary (before other
+/// flags) when it is a subcommand, else append it. Shared by the resume and
+/// fork launch-flag builders.
+fn splice_subcommand_or_append(cmd: &mut String, part: &str, is_subcommand: bool) {
+    if is_subcommand {
+        if let Some(space_pos) = cmd.find(' ') {
+            let binary = &cmd[..space_pos];
+            let flags = &cmd[space_pos..];
+            *cmd = format!("{} {}{}", binary, part, flags);
+        } else {
+            *cmd = format!("{} {}", cmd, part);
+        }
+    } else {
+        *cmd = format!("{} {}", cmd, part);
+    }
+}
+
 fn append_resume_flags(
     tool: &str,
     session_id: Option<&str>,
@@ -745,17 +814,7 @@ fn append_resume_flags(
             get_agent(tool).map(|a| &a.resume_strategy),
             Some(ResumeStrategy::Subcommand(_))
         );
-        if is_subcommand {
-            if let Some(space_pos) = cmd.find(' ') {
-                let binary = &cmd[..space_pos];
-                let flags = &cmd[space_pos..];
-                *cmd = format!("{} {}{}", binary, resume_part, flags);
-            } else {
-                *cmd = format!("{} {}", cmd, resume_part);
-            }
-        } else {
-            *cmd = format!("{} {}", cmd, resume_part);
-        }
+        splice_subcommand_or_append(cmd, &resume_part, is_subcommand);
         tracing::debug!(target: "session.store", "Added resume flags to {} command: {}", context, resume_part);
         return true;
     }
@@ -961,6 +1020,8 @@ impl Instance {
             acp_session_id: None,
             #[cfg(feature = "serve")]
             import_pending: None,
+            #[cfg(feature = "serve")]
+            fork_pending: None,
             last_error_check: None,
             last_start_time: None,
             last_error: None,
@@ -1618,6 +1679,16 @@ impl Instance {
                 }
                 return (session_id, false);
             }
+            ResumeIntent::Fork { .. } => {
+                // The child id was pre-generated and stored in
+                // agent_session_id at creation. acquire returns it as the
+                // session this instance owns; the actual fork flags
+                // (--resume <parent> --fork-session --session-id <child>) are
+                // emitted by apply_session_flags, which reads the parent off
+                // the Fork intent. Report `false` (not an in-place resume): a
+                // fork starts a new session.
+                return (self.agent_session_id.clone(), false);
+            }
             ResumeIntent::Default => {}
         }
 
@@ -1835,6 +1906,24 @@ impl Instance {
     }
 
     fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> bool {
+        if let ResumeIntent::Fork { from } = self.resume_intent.clone() {
+            let child = self.agent_session_id.clone();
+            if let Some(child_id) = child.as_deref() {
+                let fork_part = build_fork_flags(&self.tool, &from, child_id);
+                if !fork_part.is_empty() {
+                    // Codex's fork is a subcommand and must sit right after the
+                    // binary (before other flags), like its resume subcommand.
+                    // Flag-shaped forks (claude, opencode) append.
+                    let is_subcommand = matches!(
+                        crate::agents::get_agent(&self.tool).map(|a| &a.fork_strategy),
+                        Some(crate::agents::ForkStrategy::CodexFork)
+                    );
+                    splice_subcommand_or_append(cmd, &fork_part, is_subcommand);
+                }
+            }
+            // A fork is a fresh session, not an in-place resume.
+            return false;
+        }
         let (session_id, is_existing) = self.acquire_session_id();
         let emitted =
             append_resume_flags(&self.tool, session_id.as_deref(), is_existing, cmd, context);
@@ -2691,7 +2780,14 @@ impl Instance {
         expected_prior_intent: ResumeIntent,
     ) -> SidPersistOutcome {
         let new_sid = self.agent_session_id.clone();
-        let promote_cleared = matches!(expected_prior_intent, ResumeIntent::Cleared);
+        // Both Cleared and Fork are one-shot: after the launch they ran with
+        // completes, the session resumes its own id normally, so the intent
+        // must auto-promote to Default. A fork left as Fork on disk would
+        // re-fork the parent on the next restart (double-fork).
+        let promote_one_shot = matches!(
+            expected_prior_intent,
+            ResumeIntent::Cleared | ResumeIntent::Fork { .. }
+        );
 
         if let Some(ref sid) = new_sid {
             if !is_valid_session_id(sid) {
@@ -2737,7 +2833,7 @@ impl Instance {
             inst.agent_session_id = new_sid_for_closure.clone();
             inst.resume_probe_failed_sid = None;
 
-            if promote_cleared {
+            if promote_one_shot {
                 if inst.resume_intent == expected_prior_intent_for_closure {
                     inst.resume_intent = ResumeIntent::Default;
                 } else {
@@ -2756,7 +2852,7 @@ impl Instance {
         match outcome {
             Ok(SidWrite::Applied) => {
                 self.resume_probe_failed_sid = None;
-                if promote_cleared {
+                if promote_one_shot {
                     if let Ok(insts) = storage.load() {
                         if let Some(disk) = insts.into_iter().find(|i| i.id == self.id) {
                             self.resume_intent = disk.resume_intent;
@@ -5061,6 +5157,28 @@ mod tests {
         assert!(back.is_trashed());
     }
 
+    // A non-fork session omits fork_pending on the wire (skip_serializing_if),
+    // so legacy sessions.json without the key deserializes to None and no
+    // migration is needed. A seeded fork id round-trips.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn test_fork_pending_serde_roundtrip_and_default() {
+        let fresh = Instance::new("s", "/tmp/x");
+        let fresh_json = serde_json::to_string(&fresh).expect("serialize fresh");
+        assert!(
+            !fresh_json.contains("fork_pending"),
+            "None fork_pending must not be serialized"
+        );
+        let parsed: Instance = serde_json::from_str(&fresh_json).expect("parse fresh");
+        assert_eq!(parsed.fork_pending, None, "missing fork_pending => None");
+
+        let mut inst = Instance::new("s", "/tmp/x");
+        inst.fork_pending = Some("parent-acp-id".into());
+        let json = serde_json::to_string(&inst).expect("serialize");
+        let back: Instance = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(back.fork_pending.as_deref(), Some("parent-acp-id"));
+    }
+
     #[test]
     fn test_snooze_clears_pin() {
         let mut inst = Instance::new("s", "/tmp/x");
@@ -6102,6 +6220,99 @@ mod tests {
 
         let flags = build_resume_flags("opencode", "id; echo pwned", false);
         assert_eq!(flags, "");
+    }
+
+    #[test]
+    fn fork_intent_emits_resume_fork_session_and_pins_child() {
+        let flags = build_fork_flags(
+            "claude",
+            "parent-1111-2222-3333-444444444444",
+            "child-5555-6666-7777-888888888888",
+        );
+        assert_eq!(
+            flags,
+            "--resume parent-1111-2222-3333-444444444444 --fork-session --session-id child-5555-6666-7777-888888888888"
+        );
+    }
+
+    #[test]
+    fn fork_flags_reject_invalid_ids() {
+        assert_eq!(
+            build_fork_flags("claude", "$(rm -rf /)", "child"),
+            String::new()
+        );
+        assert_eq!(
+            build_fork_flags("claude", "parent", "; echo pwned"),
+            String::new()
+        );
+    }
+
+    #[test]
+    fn fork_flags_empty_for_unsupported_agent() {
+        assert_eq!(build_fork_flags("cursor", "parent", "child"), String::new());
+    }
+
+    #[test]
+    fn acquire_session_id_fork_pins_child_and_reports_fresh() {
+        let mut inst = Instance::new("Forked", "/tmp/x");
+        inst.tool = "claude".to_string();
+        // The child id was pre-generated and stored in agent_session_id at
+        // creation; the Fork intent carries the parent to resume from.
+        inst.agent_session_id = Some("child-5555-6666-7777-888888888888".to_string());
+        inst.resume_intent = ResumeIntent::Fork {
+            from: "parent-1111-2222-3333-444444444444".to_string(),
+        };
+        let mut cmd = "claude".to_string();
+        let is_existing = inst.apply_session_flags(&mut cmd, "test");
+        assert_eq!(
+            cmd,
+            "claude --resume parent-1111-2222-3333-444444444444 --fork-session --session-id child-5555-6666-7777-888888888888"
+        );
+        // A fork is a NEW session (not a resume-in-place), so report not-existing.
+        assert!(!is_existing);
+        // The child id we will resume from here on stays pinned in agent_session_id.
+        assert_eq!(
+            inst.agent_session_id.as_deref(),
+            Some("child-5555-6666-7777-888888888888")
+        );
+    }
+
+    #[test]
+    fn fork_flags_for_codex_and_opencode() {
+        // Codex: `fork <parent>` subcommand. child_id unused (codex mints its own).
+        let codex = build_fork_flags("codex", "parent-id", "ignored-child");
+        assert_eq!(codex, "fork parent-id");
+        // OpenCode: resume the parent session and add --fork. agent mints new id.
+        let oc = build_fork_flags("opencode", "parent-id", "ignored-child");
+        assert_eq!(oc, "--session parent-id --fork");
+    }
+
+    #[test]
+    fn fork_command_inserts_codex_subcommand_after_binary() {
+        // codex fork must sit right after the binary, before other flags,
+        // mirroring how codex `resume` is inserted as a subcommand.
+        let mut inst = Instance::new("Forked", "/tmp/x");
+        inst.tool = "codex".to_string();
+        inst.agent_session_id = Some("child-ignored-by-codex".to_string());
+        inst.resume_intent = ResumeIntent::Fork {
+            from: "parent-1234".to_string(),
+        };
+        let mut cmd = "codex --some-flag".to_string();
+        inst.apply_session_flags(&mut cmd, "test");
+        assert_eq!(cmd, "codex fork parent-1234 --some-flag");
+    }
+
+    #[test]
+    fn fork_command_appends_opencode_flags() {
+        let mut inst = Instance::new("Forked", "/tmp/x");
+        inst.tool = "opencode".to_string();
+        inst.agent_session_id = Some("child-ignored".to_string());
+        inst.resume_intent = ResumeIntent::Fork {
+            from: "parent-9999".to_string(),
+        };
+        let mut cmd = "opencode".to_string();
+        inst.apply_session_flags(&mut cmd, "test");
+        assert_eq!(cmd, "opencode --session parent-9999 --fork");
     }
 
     // Test: backwards compatibility - load old JSON without agent_session_id
@@ -7201,6 +7412,9 @@ mod tests {
                 ResumeIntent::Default,
                 ResumeIntent::Use("abc".to_string()),
                 ResumeIntent::Cleared,
+                ResumeIntent::Fork {
+                    from: "some-parent-id".to_string(),
+                },
             ] {
                 let json = serde_json::to_string(&intent).unwrap();
                 let back: ResumeIntent = serde_json::from_str(&json).unwrap();
@@ -7221,6 +7435,17 @@ mod tests {
             assert_eq!(
                 serde_json::to_string(&ResumeIntent::Cleared).unwrap(),
                 r#"{"kind":"Cleared"}"#
+            );
+            // `Fork` is a struct variant, so its `value` is a nested object
+            // (`{"from":...}`), not a bare string like `Use`. This shape is
+            // persisted to `sessions.json`; pin it so a refactor cannot break
+            // deserialisation of saved fork seeds.
+            assert_eq!(
+                serde_json::to_string(&ResumeIntent::Fork {
+                    from: "some-parent-id".to_string()
+                })
+                .unwrap(),
+                r#"{"kind":"Fork","value":{"from":"some-parent-id"}}"#
             );
         }
 
@@ -8112,6 +8337,55 @@ mod tests {
                 "Cleared must auto-promote to Default in the same flock"
             );
             assert_eq!(inst.resume_intent, ResumeIntent::Default);
+        }
+
+        #[test]
+        #[serial]
+        fn fork_intent_promotes_to_default_after_launch() {
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let profile = "fork-promote";
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+            let mut inst = Instance::new("Forked", "/tmp/x");
+            inst.tool = "claude".into();
+            inst.source_profile = profile.into();
+            inst.agent_session_id = Some("019342ab-1234-7def-8901-abcdef012345".into());
+            inst.resume_intent = ResumeIntent::Fork {
+                from: "019342aa-2222-7eee-8fff-aaaabbbbcccc".into(),
+            };
+            let on_disk = inst.clone();
+            storage
+                .update(|i, g| {
+                    *i = vec![on_disk.clone()];
+                    *g = crate::session::GroupTree::new_with_groups(
+                        std::slice::from_ref(&on_disk),
+                        &[],
+                    )
+                    .get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            // Simulate the post-launch persist: expected_prior_intent is the Fork
+            // we launched with; the child id is already pinned in agent_session_id.
+            let expected_prior = inst.resume_intent.clone();
+            let expected_sid = inst.agent_session_id.clone();
+            let _ = inst.persist_session_id(profile, expected_sid.as_deref(), expected_prior);
+
+            let reloaded = storage.load().unwrap();
+            let disk = reloaded.iter().find(|i| i.id == inst.id).unwrap();
+            assert_eq!(
+                disk.resume_intent,
+                ResumeIntent::Default,
+                "Fork must auto-promote to Default after the first launch so restarts resume the child plainly"
+            );
+            assert_eq!(
+                disk.agent_session_id.as_deref(),
+                Some("019342ab-1234-7def-8901-abcdef012345")
+            );
         }
 
         #[test]

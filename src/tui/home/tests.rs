@@ -4605,6 +4605,7 @@ fn test_create_session_in_all_mode_is_findable() {
         extra_args: String::new(),
         command_override: String::new(),
         scratch: false,
+        fork_seed: None,
     };
 
     let session_id = view.create_session(data).unwrap();
@@ -5134,6 +5135,195 @@ fn test_session_context_menu_new_session_prefills_from_session() {
         .expect("NewFromSelection should open the new-session dialog");
     assert_eq!(dialog.path_value(), "/tmp/work");
     assert_eq!(dialog.group_value(), "work");
+}
+
+#[test]
+#[serial]
+fn fork_from_selection_seeds_terminal_fork_and_inherits_parent_context() {
+    let mut env = create_test_env_empty();
+    let mut inst = Instance::new("parent", "/tmp/repo");
+    inst.source_profile = "test".to_string();
+    inst.tool = "claude".into();
+    inst.agent_session_id = Some("parent-1111-2222-3333-444444444444".into());
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.selected_session = Some(id);
+
+    env.view.open_fork_from_selection();
+
+    let dialog = env
+        .view
+        .new_dialog
+        .as_ref()
+        .expect("fork opens the new-session dialog");
+    let seed = dialog.fork_seed().cloned().expect("fork seed present");
+    match seed {
+        crate::session::ForkSeed::Terminal {
+            parent_agent_session_id,
+            child_session_id,
+        } => {
+            assert_eq!(
+                parent_agent_session_id,
+                "parent-1111-2222-3333-444444444444"
+            );
+            assert_ne!(child_session_id, "parent-1111-2222-3333-444444444444");
+            assert!(!child_session_id.is_empty());
+        }
+        other => panic!("expected Terminal fork seed, got {other:?}"),
+    }
+    assert_eq!(dialog.path_value(), "/tmp/repo");
+}
+
+#[test]
+#[serial]
+fn fork_denied_for_resume_only_agent_shows_info() {
+    let mut env = create_test_env_empty();
+    let mut inst = Instance::new("parent", "/tmp/repo");
+    inst.source_profile = "test".to_string();
+    inst.tool = "gemini".into();
+    inst.agent_session_id = Some("parent-uuid".into());
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.selected_session = Some(id);
+
+    env.view.open_fork_from_selection();
+
+    assert!(
+        env.view.new_dialog.is_none(),
+        "no dialog for an unforkable agent"
+    );
+    assert!(
+        env.view.info_dialog.is_some(),
+        "an explanatory info dialog is shown instead"
+    );
+}
+
+/// The fork seed forks the parent's agent, so the dialog must open preselected
+/// on that agent rather than the configured default. A Codex parent forking
+/// while the default tool is claude must land on codex, not claude (otherwise
+/// the dialog's tool and the seed disagree).
+#[test]
+#[serial]
+fn fork_from_selection_preselects_parent_tool() {
+    let mut env = create_test_env_empty();
+    env.view
+        .set_available_tools(AvailableTools::with_tools(&["claude", "codex"]));
+    let mut inst = Instance::new("parent", "/tmp/repo");
+    inst.source_profile = "test".to_string();
+    inst.tool = "codex".into();
+    inst.agent_session_id = Some("parent-1111-2222-3333-444444444444".into());
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.selected_session = Some(id);
+
+    env.view.open_fork_from_selection();
+
+    let dialog = env
+        .view
+        .new_dialog
+        .as_ref()
+        .expect("fork opens the new-session dialog");
+    assert_eq!(
+        dialog.selected_tool(),
+        "codex",
+        "fork dialog must preselect the parent's agent so it matches the seed"
+    );
+}
+
+/// A structured (ACP) parent forks via the ACP `session/fork` handshake, so the
+/// seed must be `Structured` carrying the parent's captured ACP session id, not
+/// a terminal resume-with-fork-flag seed.
+#[cfg(feature = "serve")]
+#[test]
+#[serial]
+fn fork_from_selection_structured_parent_seeds_structured_fork() {
+    let mut env = create_test_env_empty();
+    let mut inst = Instance::new("parent", "/tmp/repo");
+    inst.source_profile = "test".to_string();
+    inst.tool = "claude".into();
+    inst.view = crate::session::View::Structured;
+    inst.acp_session_id = Some("acp-parent-9999".into());
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.selected_session = Some(id);
+
+    env.view.open_fork_from_selection();
+
+    let dialog = env
+        .view
+        .new_dialog
+        .as_ref()
+        .expect("fork opens the new-session dialog for a structured parent");
+    let seed = dialog.fork_seed().cloned().expect("fork seed present");
+    assert_eq!(
+        seed,
+        crate::session::ForkSeed::Structured {
+            parent_acp_session_id: "acp-parent-9999".into(),
+        },
+        "a structured parent must seed a structured fork from its ACP session id"
+    );
+}
+
+/// A structured parent with no captured ACP session id yet has no conversation
+/// to fork; the dialog must not open and an explanatory info dialog is shown.
+#[cfg(feature = "serve")]
+#[test]
+#[serial]
+fn fork_from_selection_structured_parent_without_acp_id_denies() {
+    let mut env = create_test_env_empty();
+    let mut inst = Instance::new("parent", "/tmp/repo");
+    inst.source_profile = "test".to_string();
+    inst.tool = "claude".into();
+    inst.view = crate::session::View::Structured;
+    inst.acp_session_id = None;
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.selected_session = Some(id);
+
+    env.view.open_fork_from_selection();
+
+    assert!(
+        env.view.new_dialog.is_none(),
+        "no dialog for a structured parent with no captured ACP session"
+    );
+    assert!(
+        env.view.info_dialog.is_some(),
+        "an explanatory info dialog is shown instead"
+    );
+}
+
+/// A structured parent whose agent is resume-only (aoe-agent: ACP-capable but
+/// no fork strategy) must be refused at the capability gate, BEFORE the
+/// captured-conversation check, even when it has an acp_session_id. Otherwise
+/// the fork would silently downgrade to session/new at the handshake. This is
+/// the exact silent-downgrade the reviewer flagged; the gate mirrors the REST
+/// create guard and the web `acp_can_fork` projection.
+#[cfg(feature = "serve")]
+#[test]
+#[serial]
+fn fork_from_selection_structured_unforkable_agent_denies() {
+    let mut env = create_test_env_empty();
+    let mut inst = Instance::new("parent", "/tmp/repo");
+    inst.source_profile = "test".to_string();
+    inst.tool = "aoe-agent".into();
+    inst.view = crate::session::View::Structured;
+    // A captured conversation IS present, so only the capability gate can
+    // refuse (proving the gate runs before the acp-id check).
+    inst.acp_session_id = Some("acp-parent-1234".into());
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.selected_session = Some(id);
+
+    env.view.open_fork_from_selection();
+
+    assert!(
+        env.view.new_dialog.is_none(),
+        "no dialog for a structured parent whose agent cannot fork"
+    );
+    assert!(
+        env.view.info_dialog.is_some(),
+        "an explanatory 'Fork not supported' info dialog is shown instead"
+    );
 }
 
 #[test]
@@ -5736,6 +5926,7 @@ fn test_apply_creation_results_returns_session_id() {
         extra_args: String::new(),
         command_override: String::new(),
         scratch: false,
+        fork_seed: None,
     };
 
     // Use the async CreationPoller path (pass None hooks, non-sandbox,
@@ -12799,6 +12990,7 @@ mod new_session_attach_mode {
             extra_args: String::new(),
             command_override: String::new(),
             scratch: false,
+            fork_seed: None,
         }
     }
 
@@ -13864,8 +14056,11 @@ mod right_click_context_menu {
             .map(|(_, l)| *l)
             .collect();
         // Default sort here is Newest, where Snooze is gated out. The unread
-        // toggle is always-on (any sort) and defaults on, so the archived-row
-        // menu is New Session / Rename / Unarchive / Mark unread / Delete.
+        // toggle is always-on (any sort) and defaults on. The default session
+        // tool is claude (a forkable terminal agent), so the Fork row shows;
+        // `right_click_session_menu_hides_fork_for_unforkable_agent` covers the
+        // gated-off case. Menu is New Session / Rename / Unarchive / Mark unread
+        // / Delete / Fork.
         assert_eq!(
             labels,
             vec![
@@ -13873,7 +14068,8 @@ mod right_click_context_menu {
                 "Rename",
                 "Unarchive",
                 "Mark unread",
-                "Delete"
+                "Delete",
+                "Fork session"
             ]
         );
 
@@ -13883,6 +14079,61 @@ mod right_click_context_menu {
         assert!(
             !env.view.get_instance(&id).unwrap().is_archived(),
             "context-menu Unarchive must unarchive the session"
+        );
+    }
+
+    /// A forkable agent (claude, the default test tool) shows the "Fork
+    /// session" row so the mouse path matches the palette action.
+    #[test]
+    #[serial]
+    fn right_click_session_menu_shows_fork_for_forkable_agent() {
+        let mut env = create_test_env_with_sessions(1);
+        setup_inner(&mut env);
+        assert!(env.view.handle_right_click(5, 1));
+        let actions: Vec<ContextMenuAction> = env
+            .view
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .items_for_test()
+            .iter()
+            .map(|(a, _)| *a)
+            .collect();
+        assert!(
+            actions.contains(&ContextMenuAction::Fork),
+            "a forkable agent (claude) must show the Fork row"
+        );
+    }
+
+    /// A resume-only agent (gemini declares `ForkStrategy::Unsupported`) cannot
+    /// fork, so the menu must omit the "Fork session" row rather than offer an
+    /// action the palette would refuse.
+    #[test]
+    #[serial]
+    fn right_click_session_menu_hides_fork_for_unforkable_agent() {
+        let mut env = create_test_env_with_sessions(1);
+        setup_inner(&mut env);
+        let id = match &env.view.flat_items[0] {
+            Item::Session { id, .. } => id.clone(),
+            _ => panic!("expected a session row"),
+        };
+        env.view
+            .apply_user_action(&id, |inst| inst.tool = "gemini".to_string())
+            .unwrap();
+        env.view.flat_items = env.view.build_flat_items();
+        assert!(env.view.handle_right_click(5, 1));
+        let actions: Vec<ContextMenuAction> = env
+            .view
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .items_for_test()
+            .iter()
+            .map(|(a, _)| *a)
+            .collect();
+        assert!(
+            !actions.contains(&ContextMenuAction::Fork),
+            "a resume-only agent (gemini) must not show the Fork row"
         );
     }
 
@@ -13924,6 +14175,40 @@ mod right_click_context_menu {
             menu_actions(&env).contains(&ContextMenuAction::ToggleSnooze),
             "Snooze must appear in Attention sort"
         );
+    }
+
+    /// For a forkable agent the Fork row is sort-independent: unlike Snooze
+    /// (gated to Attention sort) it appears in every sort. Whether the row shows
+    /// at all is gated on fork capability, covered by the
+    /// `..._shows_fork_for_forkable_agent` / `..._hides_fork_for_unforkable_agent`
+    /// pair; this test pins that the capability gate does not accidentally
+    /// couple to sort order. The default test tool is claude (forkable).
+    #[test]
+    #[serial]
+    fn right_click_session_menu_offers_fork_in_every_sort_for_forkable_agent() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+
+        let has_fork = |env: &TestEnv| -> bool {
+            env.view
+                .context_menu
+                .as_ref()
+                .unwrap()
+                .items_for_test()
+                .iter()
+                .any(|(a, _)| *a == ContextMenuAction::Fork)
+        };
+
+        for sort in [SortOrder::Newest, SortOrder::Attention] {
+            env.view.sort_order = sort;
+            env.view.flat_items = env.view.build_flat_items();
+            assert!(env.view.handle_right_click(5, 1));
+            assert!(
+                has_fork(&env),
+                "Fork must be offered for a forkable agent in {sort:?} sort"
+            );
+            env.view.context_menu = None;
+        }
     }
 
     #[test]

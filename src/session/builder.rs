@@ -48,6 +48,9 @@ pub struct InstanceParams {
     /// the deletion path removes the directory. Mutually exclusive with
     /// worktree/workspace and with non-empty `extra_repo_paths`.
     pub scratch: bool,
+    /// One-shot fork seed. When `Some`, the freshly-built instance is set up
+    /// to fork its parent on first launch instead of starting fresh.
+    pub fork_seed: Option<crate::session::ForkSeed>,
 }
 
 /// Result of building an instance, tracking what was created for cleanup purposes.
@@ -712,6 +715,41 @@ pub fn build_instance(
             before_start_env: Vec::new(),
             container_workdir: None,
         });
+    }
+
+    if let Some(seed) = params.fork_seed {
+        match seed {
+            crate::session::ForkSeed::Terminal {
+                parent_agent_session_id,
+                child_session_id,
+            } => {
+                // Pre-pin the child id so it is durable on disk before launch,
+                // and carry the parent on the one-shot Fork intent.
+                instance.agent_session_id = Some(child_session_id);
+                instance.resume_intent = crate::session::ResumeIntent::Fork {
+                    from: parent_agent_session_id,
+                };
+            }
+            crate::session::ForkSeed::Structured {
+                parent_acp_session_id,
+            } => {
+                // Structured fork: force the structured view, seed the parent
+                // for the ACP session/fork handshake, and replay history into
+                // the (empty) event store on first connect. The marker fields
+                // live behind the serve feature, so without it a structured
+                // fork is inapplicable and this arm is a no-op. Bind the field
+                // to `_` on bare-core so the destructure reads it without an
+                // `allow(unused_variables)` suppression (AGENTS.md).
+                #[cfg(feature = "serve")]
+                {
+                    instance.view = crate::session::View::Structured;
+                    instance.fork_pending = Some(parent_acp_session_id);
+                    instance.import_pending = Some(true);
+                }
+                #[cfg(not(feature = "serve"))]
+                let _ = parent_acp_session_id;
+            }
+        }
     }
 
     Ok(BuildResult {
@@ -1628,6 +1666,7 @@ mod tests {
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
             scratch: false,
+            fork_seed: None,
         }
     }
 
@@ -1784,6 +1823,92 @@ mod tests {
         assert!(super::super::scratch::is_scratch_path(&provisioned));
 
         let _ = std::fs::remove_dir_all(&provisioned);
+    }
+
+    #[test]
+    fn build_instance_applies_terminal_fork_seed() {
+        use crate::session::ForkSeed;
+        let params = InstanceParams {
+            title: "Forked".into(),
+            path: "/tmp".into(),
+            group: String::new(),
+            tool: "claude".into(),
+            worktree_enabled: false,
+            worktree_branch: None,
+            create_new_branch: false,
+            base_branch: None,
+            sandbox: false,
+            sandbox_image: String::new(),
+            yolo_mode: false,
+            extra_env: vec![],
+            extra_args: String::new(),
+            command_override: String::new(),
+            extra_repo_paths: vec![],
+            scratch: false,
+            fork_seed: Some(ForkSeed::Terminal {
+                parent_agent_session_id: "parent-uuid".into(),
+                child_session_id: "child-uuid".into(),
+            }),
+        };
+        let inst = build_instance(params, &[], &[], "default")
+            .unwrap()
+            .instance;
+        // The pre-pinned child id lives in agent_session_id; the parent rides on
+        // the one-shot Fork intent.
+        assert_eq!(inst.agent_session_id.as_deref(), Some("child-uuid"));
+        assert!(
+            matches!(
+                inst.resume_intent,
+                crate::session::instance::ResumeIntent::Fork { ref from } if from == "parent-uuid"
+            ),
+            "fork intent must carry the parent id in `from`, got {:?}",
+            inst.resume_intent
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn build_instance_applies_structured_fork_seed() {
+        use crate::session::ForkSeed;
+        let params = InstanceParams {
+            title: "Forked".into(),
+            path: "/tmp".into(),
+            group: String::new(),
+            tool: "claude".into(),
+            worktree_enabled: false,
+            worktree_branch: None,
+            create_new_branch: false,
+            base_branch: None,
+            sandbox: false,
+            sandbox_image: String::new(),
+            yolo_mode: false,
+            extra_env: vec![],
+            extra_args: String::new(),
+            command_override: String::new(),
+            extra_repo_paths: vec![],
+            scratch: false,
+            fork_seed: Some(ForkSeed::Structured {
+                parent_acp_session_id: "parent-acp-id".into(),
+            }),
+        };
+        let inst = build_instance(params, &[], &[], "default")
+            .unwrap()
+            .instance;
+        // The structured arm forces the structured view and sets the two paired
+        // one-shot markers: fork_pending carries the parent for session/fork,
+        // and import_pending replays history into the fresh event store. A
+        // regression on any of the three should fail here, not only in the
+        // aggregate structured e2e.
+        assert_eq!(inst.view, crate::session::View::Structured);
+        assert_eq!(inst.fork_pending.as_deref(), Some("parent-acp-id"));
+        assert_eq!(inst.import_pending, Some(true));
+        // Structured fork does not pre-pin an agent id (the adapter mints the
+        // child id at handshake) and leaves the terminal Fork intent unset.
+        assert!(inst.agent_session_id.is_none());
+        assert!(!matches!(
+            inst.resume_intent,
+            crate::session::instance::ResumeIntent::Fork { .. }
+        ));
     }
 
     #[test]

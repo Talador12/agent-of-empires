@@ -42,6 +42,13 @@ pub struct AddArgs {
     #[arg(short = 'P', long)]
     parent: Option<String>,
 
+    /// Fork an existing session: resume its conversation context in a new,
+    /// independent session that then diverges. Give the source session's id or
+    /// title. Terminal fork; available for agents that support forking
+    /// (claude, codex, opencode).
+    #[arg(long = "fork-from")]
+    fork_from: Option<String>,
+
     /// Launch the session immediately after creating
     #[arg(short = 'l', long)]
     launch: bool,
@@ -230,6 +237,166 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     let storage = Storage::new_unwatched(profile)?;
     let (instances, _groups) = storage.load_with_groups()?;
     let final_title = resolve_session_title(&args, &instances)?;
+
+    // Resolve the agent tool now, before any worktree/scratch side effects.
+    // The fork-eligibility gate keys off the resolved tool (and the source
+    // session's captured agent id), and both are knowable here: resolving and
+    // validating before resource creation means an unforkable agent or a
+    // parent with no captured session bails without orphaning a worktree or
+    // scratch directory. The instance does not exist yet, so the seed is held
+    // and applied once the instance is built.
+    // `mut` because a `--fork-from` with no explicit `--tool`/`--cmd` inherits
+    // the parent's agent below.
+    let mut resolved_tool = resolve_tool_for_add(&args, &config)?;
+
+    // `--fork-from` performs a TERMINAL fork (it seeds `agent_session_id` + a
+    // one-shot Fork resume intent). Pairing it with a structured-view request
+    // would write that terminal state onto a structured session, which is
+    // incoherent: structured fork is its own flow (ACP `session/fork`) and is
+    // offered from the web dashboard, not here. Reject it here, before any
+    // worktree or scratch directory is created, so the refusal leaks nothing.
+    // The structured-view flags are serve-gated, so `wants_structured` is
+    // always false on bare-core.
+    #[cfg(feature = "serve")]
+    let wants_structured = args.structured_view || args.agent.is_some();
+    #[cfg(not(feature = "serve"))]
+    let wants_structured = false;
+    if args.fork_from.is_some() && wants_structured {
+        bail!(
+            "`--fork-from` performs a terminal fork and cannot be combined with \
+             --structured-view or --agent; structured fork is available from the web dashboard."
+        );
+    }
+
+    // A terminal fork resumes the parent's captured conversation in place: the
+    // agent finds that conversation by session id under the SAME working
+    // directory and filesystem view. Flags that move the cwd (`--worktree` /
+    // `--new-branch` / `--scratch`) or swap the filesystem (`--sandbox` /
+    // `--sandbox-image`) silently break that lookup, and a user-supplied launch
+    // command carrying its own resume/fork flags collides with the ones the
+    // Fork intent appends. Reject these up front (before any resource creation)
+    // rather than launch a fork that can't find its parent. See PR review.
+    if args.fork_from.is_some() {
+        if args.worktree_branch.is_some() || args.create_branch {
+            bail!(
+                "`--fork-from` cannot be combined with --worktree or --new-branch: a fork must run \
+                 in the parent's working directory to resume its conversation."
+            );
+        }
+        if args.scratch {
+            bail!(
+                "`--fork-from` cannot be combined with --scratch: a scratch session runs in a fresh \
+                 temporary directory, so the fork could not resume the parent's conversation."
+            );
+        }
+        if args.sandbox || args.sandbox_image.is_some() {
+            bail!(
+                "`--fork-from` cannot be combined with --sandbox or --sandbox-image: the sandbox \
+                 changes the agent's filesystem view and breaks the resumed conversation."
+            );
+        }
+        // --cmd-override swaps the launched binary out from under the tool: the
+        // Fork intent builds its resume+fork flags for `instance.tool`, but the
+        // override binary may be a different agent that rejects them (or, worse,
+        // a different agent handed the parent's agent-shaped id). Reject the
+        // pair rather than launch a cross-agent fork the tool check can't see.
+        if args.cmd_override.is_some() {
+            bail!(
+                "`--fork-from` cannot be combined with --cmd-override: overriding the agent binary \
+                 decouples it from the parent's agent, so the fork's resume flags may not apply."
+            );
+        }
+        // The Fork intent appends the agent's own resume+fork flags: claude
+        // `--resume`/`--session-id`/`--fork-session`, opencode `--session`/
+        // `--fork`, codex `resume`/`fork` subcommands. A launch command that
+        // already carries any of them produces a duplicate/conflicting
+        // invocation. Match at WORD granularity (not raw substring) so a path
+        // or unrelated arg containing "fork"/"resume" (e.g. `--model resume-v2`
+        // or `/src/fork-utils`) doesn't false-trip, while `--session=ID` and the
+        // codex `fork`/`resume` subcommands still do.
+        let collides_with_fork_flags = |cmd: &str| {
+            cmd.split_whitespace().any(|w| {
+                w == "resume"
+                    || w == "fork"
+                    || w.starts_with("--resume")
+                    || w.starts_with("--session")
+                    || w.starts_with("--fork")
+            })
+        };
+        for input in [args.command.as_deref(), args.extra_args.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if collides_with_fork_flags(input) {
+                bail!(
+                    "`--fork-from` cannot be combined with a launch command (--cmd or --extra-args) \
+                     that already contains a resume or fork flag/subcommand: the fork appends its \
+                     own resume flags, which would collide."
+                );
+            }
+        }
+    }
+
+    // Validate fork eligibility eagerly and produce the one-shot seed. This is
+    // a pure decision (source-session lookup over the already-loaded
+    // `instances`, plus `terminal_fork_seed`, which only consults the agent's
+    // static fork strategy), so it is safe to run before resource creation.
+    let fork_seed: Option<crate::session::ForkSeed> = if let Some(fork_ref) = &args.fork_from {
+        let source = super::resolve_session(fork_ref, &instances)?;
+        // A source that was itself created as a fork and has not launched yet
+        // still carries a one-shot Fork intent, and its `agent_session_id` is a
+        // pre-pinned child id that no agent has written to disk. Forking from it
+        // would resume a conversation that does not exist. Refuse until the
+        // child has run once and owns a real captured id.
+        if matches!(
+            source.resume_intent,
+            crate::session::ResumeIntent::Fork { .. }
+        ) {
+            bail!(
+                "Cannot fork from session '{}': its own fork has not launched yet. Start it once, then fork from the child conversation.",
+                source.title
+            );
+        }
+        // The child must fork the SAME agent as the parent: a captured id is
+        // agent-shaped (a Claude UUID resumes only under Claude, etc.), so
+        // handing it to a different agent's `--resume` fails or resumes garbage.
+        // When the user did not explicitly choose a tool (`--tool`/`--cmd`),
+        // inherit the parent's; when they did and it differs, reject rather than
+        // launch a cross-agent fork.
+        let user_chose_tool = args.tool.is_some() || args.command.is_some();
+        if user_chose_tool && resolved_tool != source.tool {
+            bail!(
+                "Cannot fork session '{}' (agent '{}') as agent '{}': a fork must use the parent's \
+                 agent. Drop --tool/--cmd to inherit it, or fork a session created with '{}'.",
+                source.title,
+                source.tool,
+                resolved_tool,
+                resolved_tool
+            );
+        }
+        if !user_chose_tool {
+            resolved_tool = source.tool.clone();
+        }
+        let parent_agent_session_id = source.agent_session_id.clone();
+        let seed = crate::session::fork::terminal_fork_seed(
+            &resolved_tool,
+            parent_agent_session_id.as_deref(),
+            crate::session::capture::generate_claude_session_id(),
+        )
+        .map_err(|denied| match denied {
+            crate::session::ForkDenied::AgentCannotFork => anyhow::anyhow!(
+                "Agent '{}' does not support forking. Forkable agents: claude, codex, opencode.",
+                resolved_tool
+            ),
+            crate::session::ForkDenied::NoParentSession => anyhow::anyhow!(
+                "Nothing to fork: session '{}' has no captured agent session yet. Start a conversation in it first.",
+                source.title
+            ),
+        })?;
+        Some(seed)
+    } else {
+        None
+    };
 
     if let Some(branch_raw) = &args.worktree_branch {
         use crate::git::GitWorktree;
@@ -455,75 +622,16 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         instance.parent_session_id = Some(parent);
     }
 
-    if let Some(tool) = &args.tool {
-        let selection = resolve_named_tool(tool, &config)?;
-        if selection.is_custom() && args.cmd_override.is_some() {
-            bail!("--cmd-override cannot be used with configured custom agent --tool selections");
-        }
-        instance.tool = selection.name().to_string();
-    } else if let Some(cmd) = &args.command {
-        let tool_name = detect_tool(cmd)?;
-        // Verify the binary that will actually launch is on PATH before
-        // creating the session. A configured session.agent_command_override
-        // (or custom_agents) entry replaces the built-in binary, so check the
-        // resolved command, not the built-in name, otherwise `--cmd opencode`
-        // falsely bails when only the override binary (e.g.
-        // opencode-plannotator) is installed. See #1910.
-        match override_launch_binary(&tool_name, &config.session) {
-            Some(bin) => {
-                // Use the same detection as tmux (login-shell PATH fallback
-                // included) so an override binary visible only after shell
-                // init isn't rejected here while the non-override path accepts
-                // it. See #1910.
-                if !crate::tmux::is_binary_on_path(&bin) {
-                    bail!(
-                        "'{}' (from session.agent_command_override) is not installed or not on $PATH.\n\
-                         See all supported agents: aoe agents",
-                        bin
-                    );
-                }
-            }
-            None => {
-                if let Some(agent_def) = crate::agents::get_agent(&tool_name) {
-                    if !crate::tmux::is_agent_available(agent_def) {
-                        bail!(
-                            "'{}' is not installed or not on $PATH.\n\
-                             Install with: {}\n\
-                             See all supported agents: aoe agents",
-                            agent_def.binary,
-                            agent_def.install_hint
-                        );
-                    }
-                }
-            }
-        }
-        instance.tool = tool_name;
-        // Only store a custom command when the user passed extra args
-        // (e.g. "claude --resume xyz"). A bare tool name/alias should resolve
-        // through the agent definition so the correct binary is used.
+    // Tool name was resolved before worktree/scratch creation (so the fork
+    // gate could bail early without orphaning resources); assign it here.
+    instance.tool = resolved_tool;
+    // Only store a custom command when the user passed extra args via --cmd
+    // (e.g. "claude --resume xyz"). A bare tool name/alias should resolve
+    // through the agent definition so the correct binary is used.
+    if let Some(cmd) = &args.command {
         if cmd.trim().contains(' ') {
             instance.command = cmd.clone();
         }
-    } else {
-        // Use default_tool from resolved config, then first available tool, then "claude".
-        // Check custom_agents first (exact match) before resolve_tool_name (substring match),
-        // so names like "lenovo-claude" resolve as the custom agent, not built-in "claude".
-        let available_tools = crate::tmux::AvailableTools::detect();
-        let tools_list = available_tools.available_list();
-        instance.tool = config
-            .session
-            .default_tool
-            .as_deref()
-            .and_then(|name| {
-                if config.session.custom_agents.contains_key(name) {
-                    Some(name)
-                } else {
-                    crate::agents::resolve_tool_name(name)
-                }
-            })
-            .or_else(|| tools_list.first().map(|s| s.as_str()))
-            .unwrap_or("claude")
-            .to_string();
     }
 
     // Set detect_as for status detection (resolved once, avoids config load in poll loop)
@@ -582,6 +690,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         // than a silent downgrade.
         let user_picked_agent = args.agent.is_some();
         let user_wants_structured = args.structured_view || user_picked_agent;
+        // The `--fork-from` + structured-view refusal is hoisted above
+        // worktree/scratch creation (see the early fork-validation block) so it
+        // leaks no resources; nothing to re-check here.
         instance.agent_name = args.agent.clone();
         instance.agent_model = args.model.clone();
 
@@ -691,6 +802,27 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     spec.command, hint
                 );
                 instance.view = crate::session::View::Terminal;
+            }
+        }
+    }
+
+    // Apply the fork seed validated earlier (before worktree/scratch creation):
+    // pre-pin the child agent id and set the one-shot Fork intent, mirroring the
+    // builder's Terminal arm. Validating up front and mutating here keeps the
+    // eligibility error from orphaning a worktree or scratch dir.
+    if let Some(seed) = fork_seed {
+        match seed {
+            crate::session::ForkSeed::Terminal {
+                parent_agent_session_id,
+                child_session_id,
+            } => {
+                instance.agent_session_id = Some(child_session_id);
+                instance.resume_intent = crate::session::ResumeIntent::Fork {
+                    from: parent_agent_session_id,
+                };
+            }
+            crate::session::ForkSeed::Structured { .. } => {
+                // Terminal fork only from the CLI; nothing to apply.
             }
         }
     }
@@ -1196,6 +1328,81 @@ fn pick_acp_agent_name(
         "claude".into()
     } else {
         "aoe-agent".into()
+    }
+}
+
+/// Resolve the agent tool name a new session will run, performing the same
+/// PATH-availability and conflict checks the create flow needs, with no
+/// filesystem side effects. Resolved before worktree/scratch creation so the
+/// fork-eligibility gate can bail early without leaving an orphaned worktree
+/// or scratch dir behind; the resolved name is then assigned to the instance.
+///
+/// Precedence mirrors the inline create flow: explicit `--tool`, then
+/// `--cmd`, then the resolved config default / first available tool / claude.
+fn resolve_tool_for_add(args: &AddArgs, config: &crate::session::Config) -> Result<String> {
+    if let Some(tool) = &args.tool {
+        let selection = resolve_named_tool(tool, config)?;
+        if selection.is_custom() && args.cmd_override.is_some() {
+            bail!("--cmd-override cannot be used with configured custom agent --tool selections");
+        }
+        Ok(selection.name().to_string())
+    } else if let Some(cmd) = &args.command {
+        let tool_name = detect_tool(cmd)?;
+        // Verify the binary that will actually launch is on PATH before
+        // creating the session. A configured session.agent_command_override
+        // (or custom_agents) entry replaces the built-in binary, so check the
+        // resolved command, not the built-in name, otherwise `--cmd opencode`
+        // falsely bails when only the override binary (e.g.
+        // opencode-plannotator) is installed. See #1910.
+        match override_launch_binary(&tool_name, &config.session) {
+            Some(bin) => {
+                // Use the same detection as tmux (login-shell PATH fallback
+                // included) so an override binary visible only after shell
+                // init isn't rejected here while the non-override path accepts
+                // it. See #1910.
+                if !crate::tmux::is_binary_on_path(&bin) {
+                    bail!(
+                        "'{}' (from session.agent_command_override) is not installed or not on $PATH.\n\
+                         See all supported agents: aoe agents",
+                        bin
+                    );
+                }
+            }
+            None => {
+                if let Some(agent_def) = crate::agents::get_agent(&tool_name) {
+                    if !crate::tmux::is_agent_available(agent_def) {
+                        bail!(
+                            "'{}' is not installed or not on $PATH.\n\
+                             Install with: {}\n\
+                             See all supported agents: aoe agents",
+                            agent_def.binary,
+                            agent_def.install_hint
+                        );
+                    }
+                }
+            }
+        }
+        Ok(tool_name)
+    } else {
+        // Use default_tool from resolved config, then first available tool, then "claude".
+        // Check custom_agents first (exact match) before resolve_tool_name (substring match),
+        // so names like "lenovo-claude" resolve as the custom agent, not built-in "claude".
+        let available_tools = crate::tmux::AvailableTools::detect();
+        let tools_list = available_tools.available_list();
+        Ok(config
+            .session
+            .default_tool
+            .as_deref()
+            .and_then(|name| {
+                if config.session.custom_agents.contains_key(name) {
+                    Some(name)
+                } else {
+                    crate::agents::resolve_tool_name(name)
+                }
+            })
+            .or_else(|| tools_list.first().map(|s| s.as_str()))
+            .unwrap_or("claude")
+            .to_string())
     }
 }
 
