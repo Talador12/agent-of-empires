@@ -19,16 +19,16 @@ use super::poller::SessionPoller;
 
 use crate::session::capture::{
     capture_claude_session_id, capture_claude_session_id_in_container, capture_codex_session_id,
-    capture_gemini_session_id, capture_hermes_session_id, capture_pi_session_id,
-    capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed, codex_poll_fn,
-    codex_poll_fn_sandboxed, gemini_poll_fn, gemini_poll_fn_sandboxed, generate_claude_session_id,
-    hermes_poll_fn, hermes_poll_fn_sandboxed, is_valid_session_id, opencode_poll_fn,
-    opencode_poll_fn_sandboxed, pi_poll_fn, pi_poll_fn_sandboxed,
-    try_capture_codex_session_id_in_container, try_capture_gemini_session_id_in_container,
-    try_capture_hermes_session_id_in_container, try_capture_opencode_session_id,
-    try_capture_opencode_session_id_in_container, try_capture_pi_session_id_in_container,
-    try_capture_vibe_session_id_in_container, validated_session_id, vibe_poll_fn,
-    vibe_poll_fn_sandboxed,
+    capture_copilot_session_id, capture_gemini_session_id, capture_hermes_session_id,
+    capture_pi_session_id, capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed,
+    codex_poll_fn, codex_poll_fn_sandboxed, copilot_poll_fn, gemini_poll_fn,
+    gemini_poll_fn_sandboxed, generate_claude_session_id, hermes_poll_fn, hermes_poll_fn_sandboxed,
+    is_valid_session_id, opencode_poll_fn, opencode_poll_fn_sandboxed, pi_poll_fn,
+    pi_poll_fn_sandboxed, try_capture_codex_session_id_in_container,
+    try_capture_gemini_session_id_in_container, try_capture_hermes_session_id_in_container,
+    try_capture_opencode_session_id, try_capture_opencode_session_id_in_container,
+    try_capture_pi_session_id_in_container, try_capture_vibe_session_id_in_container,
+    validated_session_id, vibe_poll_fn, vibe_poll_fn_sandboxed,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1894,6 +1894,18 @@ impl Instance {
                     capture_hermes_session_id(&self.project_path, &exclusion).ok()
                 }
             }
+            "copilot" => {
+                // Copilot stores sessions in a SQLite db. Host capture reads it
+                // directly; sandbox resume is a follow-up (the container's db is
+                // not read over `docker exec`), so a sandboxed Copilot session
+                // simply starts fresh on restart.
+                if self.is_sandboxed() {
+                    None
+                } else {
+                    let exclusion = self.retroactive_capture_exclusion_set();
+                    capture_copilot_session_id(&self.project_path, &exclusion).ok()
+                }
+            }
             _ => None,
         };
         result.and_then(validated_session_id)
@@ -1961,7 +1973,14 @@ impl Instance {
             // A fork is a fresh session, not an in-place resume.
             return false;
         }
-        let (session_id, is_existing) = self.acquire_session_id();
+        let (mut session_id, is_existing) = self.acquire_session_id();
+        // Sandboxed Copilot starts fresh: the session db lives inside the
+        // container, so a host-captured or manually pinned sid would launch
+        // `--session-id <id>` against a UUID that does not resolve there.
+        // Capture is already host-only above; drop the sid to gate emission too.
+        if self.tool == "copilot" && self.is_sandboxed() {
+            session_id = None;
+        }
         let emitted =
             append_resume_flags(&self.tool, session_id.as_deref(), is_existing, cmd, context);
         is_existing && emitted
@@ -3387,6 +3406,20 @@ impl Instance {
                         extra_excludes,
                     ))
                 }
+            }
+            "copilot" => {
+                // Host-only: the Copilot session-store SQLite db is read
+                // directly on the host. Sandboxed sessions have no poller, so
+                // their session id is never captured and they start fresh on
+                // restart (sandbox resume is a follow-up).
+                if self.is_sandboxed() {
+                    return;
+                }
+                Box::new(copilot_poll_fn(
+                    self.project_path.clone(),
+                    self.id.clone(),
+                    extra_excludes,
+                ))
             }
             _ => return,
         };
@@ -7105,6 +7138,7 @@ mod tests {
             assert!(should_attempt_resume(Some("session_abc.123"), "opencode"));
             assert!(should_attempt_resume(Some("uuid-abc-123"), "codex"));
             assert!(should_attempt_resume(Some("uuid-abc-123"), "gemini"));
+            assert!(should_attempt_resume(Some("uuid-abc-123"), "copilot"));
         }
 
         #[test]
@@ -7112,10 +7146,6 @@ mod tests {
             assert!(!should_attempt_resume(
                 Some("11111111-1111-1111-1111-111111111111"),
                 "cursor"
-            ));
-            assert!(!should_attempt_resume(
-                Some("11111111-1111-1111-1111-111111111111"),
-                "copilot"
             ));
         }
 
