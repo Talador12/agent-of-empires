@@ -130,7 +130,19 @@ get_version() {
 }
 
 VERSION=$(get_version)
+VERSION="${VERSION:-unknown}"
 DATE=$(date +%Y-%m-%d)
+
+# Coarse "1.17.x"-style range from the captured version, so reviewers can
+# spot fixture drift at a glance. Returns the input unchanged on unknown shapes.
+verified_range() {
+    if [[ "${1#v}" =~ ^([0-9]+)\.([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.x"
+    else
+        echo "$1"
+    fi
+}
+VERIFIED_AGAINST=$(verified_range "$VERSION")
 
 # Capture pane content (last 50 lines to match detection logic)
 CONTENT=$(tmux capture-pane -t "$SESSION" -p -S -50)
@@ -143,6 +155,7 @@ cat > "$OUTPUT_FILE" << EOF
 # FIXTURE: $TOOL_DISPLAY - $STATE_DISPLAY State
 # Captured from: $VERSION
 # Capture date: $DATE
+# Verified against: $VERIFIED_AGAINST (last check: $DATE)
 # To add more: scripts/capture-fixtures.sh $TOOL $STATE <tmux_session> [description]
 #
 # Expected status: $(echo "$STATE" | sed 's/waiting.*/Waiting/; s/running/Running/; s/idle/Idle/')

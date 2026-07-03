@@ -1,0 +1,17 @@
+# FIXTURE: OpenCode - Idle State
+# Captured from: 1.17.12+6697cf3
+# Capture date: 2026-07-02
+# Verified against: 1.17.x (last check: 2026-07-02)
+# To add more: scripts/capture-fixtures.sh opencode idle <tmux_session> [description]
+#
+# Expected status: Idle
+# Key indicators: mini split-footer, "Ask anything..." prompt, plain "BUILD" footer, no "esc interrupt", no spinner
+
+
+█▀▀█  OpenCode
+█  █  /private/tmp/opencode-fixture-home
+▀▀▀▀
+
+Ask anything... "Fix a TODO in the codebase"
+
+ BUILD                                                                                                                                                                                       ctrl+p cmd

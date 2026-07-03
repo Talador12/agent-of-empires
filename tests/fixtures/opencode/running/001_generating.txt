@@ -1,45 +1,58 @@
 # FIXTURE: OpenCode - Running State
-# Captured from: 1.1.8
-# Capture date: 2026-01-10
+# Captured from: 1.17.12+6697cf3
+# Capture date: 2026-07-02
+# Verified against: 1.17.x (last check: 2026-07-02)
 # To add more: scripts/capture-fixtures.sh opencode running <tmux_session> [description]
 #
 # Expected status: Running
-# Key indicators: "esc interrupt" shown at bottom, spinner animation
+# Key indicators: "esc interrupt" hint and spinner chars in the footer
 
+
+  ┃                                                                                                                                                             New session - 2026-07-02T14:57:02.
+  ┃  write me a 2000 word detailed essay about the history of computer science, covering ada lovelace, alan turing, von neumann, dijkstra, knuth and be         771Z
+  ┃  thorough                                                                                                                                                   ses_0dcaaaaccffeHbSNYBYVg2jsMq
   ┃
-  ┃  # Write 'hi' to /tmp file                                                                                        12,138  6% ($0.00)
-  ┃
+                                                                                                                                                                Context
+     The History of Computer Science: From Analytical Engines to Algorithmic Foundations                                                                        0 tokens
+                                                                                                                                                                0% used
+     The history of computer science is not a linear progression from primitive counting devices to modern silicon chips, but rather a rich tapestry of         $0.00 spent
+     mathematical insight, engineering ambition, and philosophical inquiry stretching across nearly two centuries. It is a discipline that emerged from the
+     confluence of mathematics, logic, electrical engineering, and linguistics, shaped by extraordinary individuals whose intellectual contributions            ▼ MCP
+     continue to define how we think about computation itself. To understand computer science, one must trace the arc of thought from the visionary poetry      • codegraph Connected
+     of Ada Lovelace, through the profound abstractions of Alan Turing, the pragmatic architectures of John von Neumann, the disciplined rigor of Edsger        • context7 Connected
+     Dijkstra, and finally to the encyclopedic scholarship of Donald Knuth. Each of these figures represents not merely a chapter, but a paradigm shift in      • github Connected
+     how humanity understood the possibilities of mechanical and later electronic thought.                                                                      • grep_app Connected
+                                                                                                                                                                • lsp Connected
+     Ada Lovelace: The First Programmer                                                                                                                         • markitdown Disabled
+                                                                                                                                                                • perplexity Disabled
+     Augusta Ada King, Countess of Lovelace, born in 1815, occupies a unique and often mythologized position in the history of computing. The                   • serena Connected
+                                                                                                                                                                • websearch Connected
+     ▣  Sisyphus - Ultraworker · Claude Opus 4.7
+                                                                                                                                                                LSP
+                                                                                                                                                                LSPs are disabled
 
-     ▣  Build · minimax-m2.1-free · 23.8s
+                                                                                                                                                                ┌───────────────────────────────────┐
+                                                                                                                                                                │                                   │
+                                                                                                                                                                │ Models                            │
+                                                                                                                                                                │ artistry gemini-2.5-pro           │
+                                                                                                                                                                │ atlas claude-sonnet-4-6           │
+                                                                                                                                                                │ deep claude-opus-4-7              │
+                                                                                                                                                                │ explore claude-sonnet-4-6         │
+                                                                                                                                                                │ hephaestus gpt-5.5                │
+                                                                                                                                                                │ librarian claude-sonnet-4-6       │
+                                                                                                                                                                │ metis claude-opus-4-7             │
+                                                                                                                                                                │ momus claude-opus-4-7             │
+                                                                                                                                                                │ multimodal-looker gemini-2.5-     │
+                                                                                                                                                                │ flash                             │
+                                                                                                                                                                │ oracle claude-opus-4-7            │
+                                                                                                                                                                │ prometheus claude-opus-4-7        │
+                                                                                                                                                                │ quick claude-sonnet-4-6           │
+                                                                                                                                                                │                                   │
+                                                                                                                                                                └───────────────────────────────────┘
 
-  ┃
-  ┃  use the bash tool
-  ┃
-
-  ┃  Thinking: The user wants me to use the bash tool to write 'hi' to a file in /tmp. Let me use echo with bash to accomplish this.
-
-     $ echo 'hi' > /tmp/hi.txt
-
-  ┃
-  ┃  Never mind, please write me a 2000 word story
-  ┃
-
-  ┃  Thinking: The user is asking me to write a 2000 word story. This is a creative writing task, not a coding task. Let me write an
-  ┃  engaging story of approximately 2000 words.
-
-     The lighthouse keeper's daughter had been watching the storm for three days. From her bedroom window high in the tower, she could
-     see the sea churn like a massive animal restless in its cage, white-capped waves crashing against rocks that had stood unmoving
-     since before anyone could remember.
-
-     Elara had memorized every grain of that view—the way the lighthouse beam swept across the darkness every thirty seconds, the cry of
-     gulls that grew hoarse from shouting at the wind, the distant shape of the village nestled in the cove below, its windows glowing
-     like earthbound stars. She knew
-
-     ▣  Build · minimax-m2.1-free
-
-  ┃
-  ┃
-  ┃
-  ┃  Build  MiniMax M2.1 OpenCode Zen
-  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
-   ⬝⬝⬝⬝⬝⬝⬝⬝  esc interrupt                                                                              tab switch agent  ctrl+p commands
+  ┃                                                                                                                                                             ~/SAPDevelop/agent-of-empires-git-
+  ┃                                                                                                                                                             worktrees/opencode-status_detection-
+  ┃                                                                                                                                                             fixtures:fix/2606-opencode-fixtures-
+  ┃  Sisyphus - Ultraworker · Claude Opus 4.7 HAI Anthropic · max                                                                                               refresh
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝⬝⬝⬝⬝⬝⬝  esc interrupt                                                                                                       tab agents  ctrl+p commands    • OpenCode 1.17.12+6697cf3

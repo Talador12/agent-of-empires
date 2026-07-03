@@ -1,0 +1,33 @@
+# FIXTURE: OpenCode - Waiting_permission State
+# Captured from: 1.17.12+6697cf3
+# Capture date: 2026-07-02
+# Verified against: 1.17.x (last check: 2026-07-02)
+# To add more: scripts/capture-fixtures.sh opencode waiting_permission <tmux_session> [description]
+#
+# Expected status: Waiting
+# Key indicators: mini split-footer, "△ Permission required" dialog with "Allow once / Allow always / Reject" options
+
+
+█▀▀█  OpenCode
+█  █  /private/tmp/opencode-fixture-home
+▀▀▀▀
+
+› run 'ls -la /' using the bash tool
+
+# Running in /
+$ ls -la /
+
+
+
+  △ Permission required
+
+   # Shell command
+
+  $ ls -la /
+
+
+
+
+
+
+   Allow once   Allow always   Reject                                                                                                                             ⇆ select  enter confirm  esc reject

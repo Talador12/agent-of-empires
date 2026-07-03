@@ -1,0 +1,19 @@
+# FIXTURE: OpenCode - Running State
+# Captured from: 1.17.12+6697cf3
+# Capture date: 2026-07-02
+# Verified against: 1.17.x (last check: 2026-07-02)
+# To add more: scripts/capture-fixtures.sh opencode running <tmux_session> [description]
+#
+# Expected status: Running
+# Key indicators: mini split-footer, "BUILD  ⬝⬝⬝⬝⬝⬝⬝⬝ esc interrupt" in the footer
+
+
+█▀▀█  OpenCode
+█  █  /private/tmp/opencode-fixture-home
+▀▀▀▀
+
+› write me a 2000 word detailed essay about the history of computer science, covering ada lovelace, alan turing, von neumann, dijkstra, knuth and be thorough
+
+
+
+ BUILD  ⬝⬝⬝⬝⬝⬝⬝⬝ esc interrupt                                                                                                                                                               ctrl+p cmd
