@@ -269,3 +269,34 @@ The web dashboard (`web/`) is a utility that sits between a developer and a term
 - **No new build-time `@theme [data-theme=...]` blocks.** The runtime palette swap goes through CSS variables on `documentElement`; build-time scoped themes can't support user-defined TOML themes without rebuilds.
 
 If a change to `web/` would require deviating from any of the above, update this section first.
+
+## Conductor (experimental)
+
+The conductor is an orchestrator that sits above the fleet of individual sessions, ranks them by an attention score, and, when authorized, applies non-destructive nudge actions (snooze, favorite, unfavorite) to keep work moving. It is the first-party port of the standalone [aoaoe](https://github.com/Talador12/agent-of-agent-of-empires) prototype, folded into aoe per issue #553. Gated behind `AOE_EXPERIMENTAL_AO_MODE=1`; absent that env var, every surface (CLI, TUI panel, web endpoint) fails closed with an opt-in hint.
+
+### Framing: convergence, not transport
+
+The conductor's job is to drive sessions toward measurable completion, not to act as a message bus. Every recommendation is a function of observable session state, evaluated against a closed set of allowed actions, and gated by explicit user policy. This distinguishes it from generic multi-agent frameworks in two ways:
+
+1. **Signals are grounded.** Ranking inputs come from real Instance fields (`status`, `favorited_at`, `unread`, `last_accessed_at`, `snoozed_until`, `archived_at`) that the rest of aoe already produces. The conductor does not invent state; it reads state and reacts.
+2. **Actions are bounded.** The Action enum is deliberately narrow (`snooze`, `favorite`, `unfavorite`, `nudge`, `no_op`). Widening it is a review-visible change to `src/conductor/reasoner/mod.rs`, not a runtime configuration knob.
+
+### Layered separation
+
+- **Mechanism** lives in `Instance` (the attention-stack primitives: `snooze`, `unsnooze`, `favorite`, `unfavorite`, `archive`, `unarchive`). Independently useful, unchanged by the conductor's arrival.
+- **Policy** lives in `ConductorPolicies` (`allow_destructive`, `allow_nudge`, both off by default). Widened by explicit user opt-in per invocation (`--live`, `--allow-nudge`).
+- **Reasoning** lives behind a `Reasoner` trait so the model backend (currently a `claude --print` subprocess, mirrored from the aoaoe TypeScript path) is swappable without touching the tick loop.
+- **Dispatch** lives in `Executor::dispatch`, which returns an explicit `Outcome` per recommendation (`Applied` / `Blocked` / `UnknownSession` / `NoOp`). Blocked outcomes carry the policy reason so the log and (later) the UI can render "skipped because X" instead of silently dropping actions.
+
+### Surfaces
+
+Three read paths (CLI, TUI panel, `GET /api/conductor/state`) share one attention scoring function, `crate::conductor::attention_score`. A change to the score is a single-file edit; the surfaces re-project the same output.
+
+### Follow-ups (not in this first PR)
+
+- Interactive tick + apply from the TUI panel (currently palette-open, display-only).
+- Mirror into `src/tui/remote_home/` so the panel is visible when the TUI attaches to a remote daemon.
+- Server-sent-events stream on the web endpoint, so the dashboard can render fresh recommendations without polling.
+- Port the intelligence modules that need session output content (health scoring, error-pattern detection, idle escalation curves): the observation-building path needs a pane-content input first.
+- `AOE_EXPERIMENTAL_AO_MODE` promotion to a config flag once the surface stabilizes.
+

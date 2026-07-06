@@ -25,6 +25,7 @@ mod archive_restore;
 mod archive_structured;
 mod cli;
 mod command_palette;
+mod conductor;
 mod errors;
 mod filewatch_config_malformed;
 mod filewatch_config_profile_removal;
