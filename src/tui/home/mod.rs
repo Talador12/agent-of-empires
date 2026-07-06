@@ -35,7 +35,7 @@ use super::deletion_poller::DeletionPoller;
 #[cfg(feature = "serve")]
 use super::dialogs::ServeView;
 use super::dialogs::{
-    ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
+    ChangelogDialog, CommandPaletteDialog, ConductorView, ConfirmDialog, ContextMenuDialog,
     GroupDeleteOptionsDialog, GroupPickerDialog, HooksInstallDialog, InfoDialog, IntroDialog,
     NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
     ProjectSessionPickerDialog, ProjectsDialog, RenameDialog, RepoTrustDialog, RestartDialog,
@@ -507,6 +507,10 @@ pub struct HomeView {
     pub(super) command_palette: Option<CommandPaletteDialog>,
     #[cfg(feature = "serve")]
     pub(super) serve_view: Option<ServeView>,
+    /// Experimental orchestrator panel (issue #553). Present regardless of
+    /// the `serve` feature; the panel is gated at open time on
+    /// `AOE_EXPERIMENTAL_AO_MODE` instead.
+    pub(super) conductor_view: Option<ConductorView>,
     pub(super) update_confirm_dialog: Option<UpdateConfirmDialog>,
     /// One-time opt-in popup for users who finished the walkthrough before
     /// telemetry existed. Startup gating keeps it from rendering over the
@@ -2041,6 +2045,7 @@ impl HomeView {
             command_palette: None,
             #[cfg(feature = "serve")]
             serve_view: None,
+            conductor_view: None,
             update_confirm_dialog: None,
             telemetry_consent_dialog: None,
             tips_dialog: None,

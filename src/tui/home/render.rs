@@ -561,6 +561,15 @@ impl HomeView {
             return;
         }
 
+        // Conductor panel (experimental, issue #553) is another full-screen
+        // takeover: it hides the session list while open, closes with Esc/q.
+        if let Some(ref conductor) = self.conductor_view {
+            self.divider_col = None;
+            self.main_area_width = 0;
+            conductor.render(frame, area, theme);
+            return;
+        }
+
         // Layout: main area + status bar + optional update bar at bottom.
         // The update bar surfaces both persistent update-available banners
         // (update_info) and transient toasts (update_status); we need a row

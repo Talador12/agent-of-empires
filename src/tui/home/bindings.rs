@@ -78,6 +78,10 @@ pub enum ActionId {
     /// Fork the selected session into a new independent session that resumes
     /// its conversation context (palette + context menu only; no chord).
     Fork,
+    /// Open the experimental conductor panel (issue #553). Palette-only:
+    /// experimental features do not consume a keyboard chord in the base
+    /// keyspace. Gated at open time on `AOE_EXPERIMENTAL_AO_MODE`.
+    Conductor,
 }
 
 /// A single chord. `ctrl` requires the Control modifier; Shift is implicit in
@@ -894,6 +898,28 @@ pub static BINDINGS: &[Binding] = &[
             serve_only: false,
         }),
     },
+    // Palette-only, experimental. Discoverability without hotkey pressure
+    // matches Plugins / Fork / Tips above.
+    Binding {
+        id: ActionId::Conductor,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Open conductor (experimental)",
+            keywords: &[
+                "conductor",
+                "orchestrator",
+                "attention",
+                "queue",
+                "ao",
+                "aoaoe",
+            ],
+            group: PaletteGroup::Settings,
+            serve_only: false,
+        }),
+    },
 ];
 
 /// Stable palette/test id for an action (matches the legacy `builtin_commands`
@@ -936,6 +962,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Tips => "tips",
         ActionId::Plugins => "plugins",
         ActionId::Fork => "fork",
+        ActionId::Conductor => "conductor",
     }
 }
 

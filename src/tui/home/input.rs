@@ -13,12 +13,12 @@ use crate::tui::app::Action;
 #[cfg(feature = "serve")]
 use crate::tui::dialogs::ServeAction;
 use crate::tui::dialogs::{
-    builtin_commands, CommandPaletteDialog, ConfirmDialog, ContextMenuAction, ContextMenuDialog,
-    DeleteDialogConfig, DialogResult, GroupDeleteOptionsDialog, HooksInstallDialog, InfoDialog,
-    IntroOutcome, NewSessionData, NewSessionDialog, NoAgentsAction, PaletteAction, PaletteCommand,
-    PaletteGroup, ProfilePickerAction, ProjectsDialog, RenameDialog, RenameMode, RepoTrustAction,
-    RestartDialog, SendMessageDialog, TipsDialog, TipsOutcome, UnifiedDeleteDialog,
-    WorktreeNameDialog,
+    builtin_commands, CommandPaletteDialog, ConductorAction, ConductorView, ConfirmDialog,
+    ContextMenuAction, ContextMenuDialog, DeleteDialogConfig, DialogResult,
+    GroupDeleteOptionsDialog, HooksInstallDialog, InfoDialog, IntroOutcome, NewSessionData,
+    NewSessionDialog, NoAgentsAction, PaletteAction, PaletteCommand, PaletteGroup,
+    ProfilePickerAction, ProjectsDialog, RenameDialog, RenameMode, RepoTrustAction, RestartDialog,
+    SendMessageDialog, TipsDialog, TipsOutcome, UnifiedDeleteDialog, WorktreeNameDialog,
 };
 use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
@@ -1601,6 +1601,18 @@ impl HomeView {
             }
         }
 
+        // Conductor panel (issue #553). Full-screen takeover, symmetric with
+        // serve above.
+        if let Some(ref mut conductor) = self.conductor_view {
+            match conductor.handle_key(key) {
+                ConductorAction::Continue => return None,
+                ConductorAction::Close => {
+                    self.conductor_view = None;
+                    return None;
+                }
+            }
+        }
+
         // Right-click context menu. Routed before every other dialog so
         // keys go to the popup that the user just opened on top of the
         // sidebar. Submit dispatches through the shared helper so the
@@ -2541,6 +2553,7 @@ impl HomeView {
             ActionId::SetWorktreeName => self.open_worktree_name_for_selected(),
             ActionId::Diff => self.open_diff_for_selected(),
             ActionId::Serve => self.open_serve(),
+            ActionId::Conductor => self.open_conductor(),
             ActionId::Settings => self.open_settings(),
             ActionId::Profiles => self.show_profile_picker(),
             ActionId::Projects => {
@@ -2956,6 +2969,27 @@ impl HomeView {
                 ));
             }
         }
+    }
+
+    fn open_conductor(&mut self) {
+        if !crate::conductor::is_enabled() {
+            self.info_dialog = Some(InfoDialog::new(
+                "Conductor is experimental",
+                &format!(
+                    "The conductor is off by default. Set {}=1 in your \
+                     shell, restart aoe, and try again.\n\n\
+                     Follow issue #553 for the roadmap and to opt in to \
+                     interactive tick/apply in a future release.",
+                    crate::conductor::EXPERIMENTAL_ENV
+                ),
+            ));
+            return;
+        }
+        let profile = self
+            .active_profile
+            .clone()
+            .unwrap_or_else(|| "main".to_string());
+        self.conductor_view = Some(ConductorView::new(profile));
     }
 
     fn open_serve(&mut self) {

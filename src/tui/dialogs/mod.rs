@@ -3,6 +3,7 @@
 mod changelog;
 mod cheats;
 mod command_palette;
+mod conductor;
 mod confirm;
 mod context_menu;
 mod custom_instruction;
@@ -36,6 +37,7 @@ pub use changelog::ChangelogDialog;
 pub use command_palette::{
     builtin_commands, CommandPaletteDialog, PaletteAction, PaletteCommand, PaletteGroup,
 };
+pub use conductor::{ConductorAction, ConductorView};
 pub use confirm::ConfirmDialog;
 pub use context_menu::{ContextMenuAction, ContextMenuDialog};
 pub use custom_instruction::CustomInstructionDialog;
