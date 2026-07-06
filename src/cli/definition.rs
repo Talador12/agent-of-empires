@@ -9,6 +9,7 @@ use clap_complete::Shell;
 #[cfg(feature = "serve")]
 use super::acp::AcpCommands;
 use super::add::AddArgs;
+use super::conductor::ConductorCommands;
 use super::extract_session_id::ExtractSessionIdArgs;
 use super::group::GroupCommands;
 use super::init::InitArgs;
@@ -120,6 +121,14 @@ pub enum Commands {
     Session {
         #[command(subcommand)]
         command: SessionCommands,
+    },
+
+    /// Experimental: orchestrate attention across sessions (issue #553).
+    /// Requires `AOE_EXPERIMENTAL_AO_MODE=1`. Also available as `aoe ao`.
+    #[command(alias = "ao")]
+    Conductor {
+        #[command(subcommand)]
+        command: ConductorCommands,
     },
 
     /// Manage groups for organizing sessions
@@ -251,6 +260,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "status",
     "killall",
     "session",
+    "conductor",
     "group",
     "plugin",
     "profile",
@@ -296,6 +306,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         // Hidden trap; never a user action, never counted.
         Commands::Stop { .. } => return None,
         Commands::Session { .. } => "session",
+        Commands::Conductor { .. } => "conductor",
         Commands::Group { .. } => "group",
         Commands::Plugin { .. } => "plugin",
         Commands::Profile { .. } => "profile",

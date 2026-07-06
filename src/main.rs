@@ -340,6 +340,7 @@ async fn main() -> Result<()> {
         Some(Commands::Status(args)) => cli::status::run(&profile, args).await,
         Some(Commands::Killall(args)) => cli::killall::run(args).await,
         Some(Commands::Session { command }) => cli::session::run(&profile, command).await,
+        Some(Commands::Conductor { command }) => cli::conductor::run(&profile, command).await,
         Some(Commands::Group { command }) => cli::group::run(&profile, command).await,
         Some(Commands::Plugin { command }) => cli::plugin::run(command).await,
         Some(Commands::Profile { command }) => cli::profile::run(command).await,

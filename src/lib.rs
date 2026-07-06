@@ -6,6 +6,7 @@ pub mod agents;
 pub mod build_info;
 pub mod claude_settings;
 pub mod cli;
+pub mod conductor;
 pub mod containers;
 /// Protocol-agnostic durable event log, the storage substrate behind the
 /// ACP transcript store and (later) the plugin host's event bus. Serve-gated
