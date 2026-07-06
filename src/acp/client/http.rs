@@ -68,6 +68,26 @@ pub enum HttpError {
     Server { status: StatusCode, body: String },
 }
 
+/// Client-side shape of `GET /api/conductor/state`. Field names match the
+/// server response (see `src/server/api/conductor.rs`) but the type is
+/// defined here so the client compiles in TUI-only builds.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RemoteConductorState {
+    pub enabled: bool,
+    pub env_var: String,
+    pub queue: Vec<RemoteConductorRow>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RemoteConductorRow {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub attention_score: i64,
+    pub favorited: bool,
+    pub unread: bool,
+}
+
 impl HttpClient {
     pub fn new(endpoint: DaemonEndpoint) -> Result<Self, HttpError> {
         let http = reqwest::Client::builder()
@@ -311,6 +331,19 @@ impl HttpClient {
         let res = self.auth(self.http.get(&url)).send().await?;
         let res = check_status(res, "<sessions>").await?;
         Ok(res.json::<Vec<T>>().await?)
+    }
+
+    /// Fetch the daemon's ranked attention queue. Returns `None` when
+    /// the daemon has the conductor gate closed (403); the remote panel
+    /// uses that to render an opt-in hint instead of an empty list.
+    pub async fn get_conductor_state(&self) -> Result<Option<RemoteConductorState>, HttpError> {
+        let url = format!("{}/api/conductor/state", self.endpoint.base_url);
+        let res = self.auth(self.http.get(&url)).send().await?;
+        if res.status() == StatusCode::FORBIDDEN {
+            return Ok(None);
+        }
+        let res = check_global_status(res).await?;
+        Ok(Some(res.json::<RemoteConductorState>().await?))
     }
 
     /// Lightweight reachability probe used by `require_daemon` (when

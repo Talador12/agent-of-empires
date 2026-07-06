@@ -1450,6 +1450,10 @@ fn build_router(state: Arc<AppState>) -> Router {
     use axum::routing::{delete, get, patch, post, put};
 
     let app = Router::new()
+        // Experimental orchestrator (issue #553). Gate is enforced in the
+        // handler, not the router, so the client can call it and get a
+        // structured 403 with the opt-in hint.
+        .route("/api/conductor/state", get(api::get_conductor_state))
         // Sessions
         .route(
             "/api/sessions",

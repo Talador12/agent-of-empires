@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use super::RemoteHomeState;
+use super::{RemoteHomeState, RemoteMode};
 use crate::tui::styles::{has_min_contrast, Theme};
 
 const SELECTED_ROW_CONTRAST_RATIO: f32 = 3.0;
@@ -23,6 +23,10 @@ fn selected_row_style(style: Style, theme: &Theme) -> Style {
 }
 
 pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeState) {
+    if state.mode == RemoteMode::Conductor {
+        render_conductor(frame, area, theme, state);
+        return;
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -34,6 +38,104 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeSt
     render_header(frame, chunks[0], theme, state);
     render_list(frame, chunks[1], theme, state);
     render_footer(frame, chunks[2], theme, state);
+}
+
+fn render_conductor(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    let title_style = Style::default()
+        .fg(theme.title)
+        .add_modifier(Modifier::BOLD);
+    let header = vec![Line::from(vec![
+        Span::styled(" Conductor · ", title_style),
+        Span::styled(
+            state.endpoint.base_url.clone(),
+            Style::default().fg(theme.text),
+        ),
+        Span::raw("  (experimental)"),
+    ])];
+    frame.render_widget(Paragraph::new(header), chunks[0]);
+
+    if let Some(err) = &state.conductor_error {
+        let msg = format!("Could not fetch conductor state: {err}");
+        frame.render_widget(
+            Paragraph::new(msg).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Fetch error "),
+            ),
+            chunks[1],
+        );
+    } else if let Some(conductor) = &state.conductor {
+        if conductor.queue.is_empty() {
+            frame.render_widget(
+                Paragraph::new("No active sessions on the daemon.")
+                    .block(Block::default().borders(Borders::ALL).title(" Queue ")),
+                chunks[1],
+            );
+        } else {
+            let rows: Vec<ListItem> = conductor
+                .queue
+                .iter()
+                .map(|row| {
+                    let mut flags = String::new();
+                    if row.favorited {
+                        flags.push('★');
+                    }
+                    if row.unread {
+                        flags.push('•');
+                    }
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!("{:>5}  ", row.attention_score),
+                            Style::default().fg(theme.accent),
+                        ),
+                        Span::styled(
+                            format!("{:<10}  ", row.status),
+                            Style::default().fg(theme.dimmed),
+                        ),
+                        Span::raw(row.title.clone()),
+                        Span::raw("  "),
+                        Span::styled(flags, Style::default().fg(theme.accent)),
+                    ]))
+                })
+                .collect();
+            let list =
+                List::new(rows).block(Block::default().borders(Borders::ALL).title(" Queue "));
+            frame.render_widget(list, chunks[1]);
+        }
+    } else {
+        // Gate closed on the daemon; suggest the opt-in path.
+        let body = "The conductor is off on the daemon. Set \n\
+             AOE_EXPERIMENTAL_AO_MODE=1 in the daemon's shell and \n\
+             restart `aoe serve`, then press `r` here.";
+        frame.render_widget(
+            Paragraph::new(body).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Gate closed "),
+            ),
+            chunks[1],
+        );
+    }
+
+    let key_style = Style::default()
+        .fg(theme.help_key)
+        .add_modifier(Modifier::BOLD);
+    let footer = Line::from(vec![
+        Span::styled(" Esc/q ", key_style),
+        Span::raw("back    "),
+        Span::styled("r ", key_style),
+        Span::raw("refresh"),
+    ]);
+    frame.render_widget(Paragraph::new(footer), chunks[2]);
 }
 
 fn render_header(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeState) {

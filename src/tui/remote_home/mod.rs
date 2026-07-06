@@ -26,7 +26,7 @@ use ratatui::Terminal;
 use serde::Deserialize;
 
 use crate::acp::client::discovery::DaemonEndpoint;
-use crate::acp::client::HttpClient;
+use crate::acp::client::{HttpClient, RemoteConductorState};
 use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
 use crate::tui::styles::Theme;
 
@@ -46,6 +46,15 @@ pub struct RemoteSession {
     pub view: crate::session::View,
 }
 
+/// Which mode the remote view is in. Session picker is the default; the
+/// conductor overlay is a toggle-in view that stays inside remote_home
+/// (does not hand off to structured_view).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteMode {
+    Sessions,
+    Conductor,
+}
+
 pub struct RemoteHomeState {
     pub endpoint: DaemonEndpoint,
     pub sessions: Vec<RemoteSession>,
@@ -53,6 +62,12 @@ pub struct RemoteHomeState {
     pub status_text: Option<String>,
     pub last_error: Option<String>,
     pub loading: bool,
+    pub mode: RemoteMode,
+    /// Fetched from `GET /api/conductor/state`. `None` means either the
+    /// gate is closed on the daemon (403 -> opt-in hint), or the fetch has
+    /// not happened yet in this session.
+    pub conductor: Option<RemoteConductorState>,
+    pub conductor_error: Option<String>,
 }
 
 impl RemoteHomeState {
@@ -64,6 +79,9 @@ impl RemoteHomeState {
             status_text: None,
             last_error: None,
             loading: true,
+            mode: RemoteMode::Sessions,
+            conductor: None,
+            conductor_error: None,
         }
     }
 
@@ -154,6 +172,24 @@ async fn run(
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             continue;
         }
+        // Conductor overlay owns most keys while open; only Esc/q get us
+        // back to the session picker.
+        if state.mode == RemoteMode::Conductor {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    state.mode = RemoteMode::Sessions;
+                }
+                KeyCode::Char('r') => {
+                    state.status_text = Some("refreshing conductor…".to_string());
+                    terminal.draw(|f| render::render(f, f.area(), theme, &state))?;
+                    refresh_conductor(&mut state).await;
+                }
+                _ => {}
+            }
+            terminal.draw(|f| render::render(f, f.area(), theme, &state))?;
+            continue;
+        }
+
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
             KeyCode::Char('r') => {
@@ -161,6 +197,14 @@ async fn run(
                 state.status_text = Some("refreshing…".to_string());
                 terminal.draw(|f| render::render(f, f.area(), theme, &state))?;
                 refresh(&mut state).await;
+            }
+            KeyCode::Char('c') => {
+                // Enter the conductor overlay. Fetch on entry so the panel
+                // is populated even on first open.
+                state.mode = RemoteMode::Conductor;
+                state.status_text = Some("fetching conductor…".to_string());
+                terminal.draw(|f| render::render(f, f.area(), theme, &state))?;
+                refresh_conductor(&mut state).await;
             }
             KeyCode::Down | KeyCode::Char('j') => state.move_cursor(1),
             KeyCode::Up | KeyCode::Char('k') => state.move_cursor(-1),
@@ -190,6 +234,33 @@ async fn run(
         terminal.draw(|f| render::render(f, f.area(), theme, &state))?;
     }
     Ok(())
+}
+
+async fn refresh_conductor(state: &mut RemoteHomeState) {
+    state.conductor_error = None;
+    let client = match HttpClient::new(state.endpoint.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            state.conductor_error = Some(format!("http client init failed: {e}"));
+            return;
+        }
+    };
+    match client.get_conductor_state().await {
+        Ok(Some(s)) => {
+            state.conductor = Some(s);
+            state.status_text = Some("conductor refreshed".to_string());
+        }
+        Ok(None) => {
+            // Gate closed on the daemon; leave conductor as-is so the
+            // render can show the opt-in hint.
+            state.conductor = None;
+            state.status_text = Some("conductor gate closed on daemon".to_string());
+        }
+        Err(e) => {
+            state.conductor_error = Some(format!("{e}"));
+            state.status_text = None;
+        }
+    }
 }
 
 async fn refresh(state: &mut RemoteHomeState) {
