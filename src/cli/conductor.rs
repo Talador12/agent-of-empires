@@ -16,6 +16,7 @@ use crate::conductor::github::{fetch_issues, session_title_for_issue};
 use crate::conductor::intelligence::{Backoff, SessionPool};
 use crate::conductor::policies::{ConductorPolicies, QuietHours};
 use crate::conductor::reasoner::claude_print::ClaudePrintReasoner;
+use crate::conductor::reasoner::opencode::OpenCodeReasoner;
 use crate::conductor::watcher::{Watcher, DEFAULT_POLL_INTERVAL};
 use crate::conductor::{self};
 use crate::session::{Instance, Storage};
@@ -60,10 +61,20 @@ pub struct ConductorWatchArgs {
     #[arg(long)]
     pub once: bool,
 
-    /// Path to the `claude` binary. Defaults to `claude` on PATH; override
-    /// for a local build or a subprocess shim in tests.
+    /// Reasoner backend: `claude-code` (subprocess to `claude --print`,
+    /// the default) or `opencode` (HTTP to a local `opencode serve`).
+    #[arg(long, default_value = "claude-code", value_parser = ["claude-code", "opencode"])]
+    pub reasoner: String,
+
+    /// Path to the `claude` binary. Ignored when `--reasoner opencode`
+    /// is set. Defaults to `claude` on `PATH`.
     #[arg(long)]
     pub reasoner_binary: Option<String>,
+
+    /// HTTP endpoint of the `opencode serve` daemon. Used when
+    /// `--reasoner opencode` is set. Defaults to `http://127.0.0.1:4096`.
+    #[arg(long)]
+    pub opencode_endpoint: Option<String>,
 
     /// Actually apply recommended actions to session state. Off by default
     /// so a first-time run is safe: recommendations are logged, not
@@ -310,25 +321,66 @@ async fn watch(profile: &str, args: ConductorWatchArgs) -> Result<()> {
         quiet_hours,
     };
 
-    let reasoner = match args.reasoner_binary {
-        Some(bin) => ClaudePrintReasoner::with_binary(bin),
-        None => ClaudePrintReasoner::default(),
-    };
+    // Reasoner type differs per backend, so drive the watcher through a
+    // generic helper rather than trying to unify the types at this call
+    // site. Both arms compile to the same tick loop.
+    match args.reasoner.as_str() {
+        "opencode" => {
+            let reasoner = match args.opencode_endpoint {
+                Some(url) => OpenCodeReasoner::with_endpoint(url),
+                None => OpenCodeReasoner::default(),
+            };
+            run_watch(
+                profile,
+                args.poll_interval,
+                args.once,
+                args.live,
+                policies,
+                reasoner,
+            )
+            .await
+        }
+        _ => {
+            let reasoner = match args.reasoner_binary {
+                Some(bin) => ClaudePrintReasoner::with_binary(bin),
+                None => ClaudePrintReasoner::default(),
+            };
+            run_watch(
+                profile,
+                args.poll_interval,
+                args.once,
+                args.live,
+                policies,
+                reasoner,
+            )
+            .await
+        }
+    }
+}
+
+async fn run_watch<R: crate::conductor::reasoner::Reasoner + 'static>(
+    profile: &str,
+    poll_interval_secs: u64,
+    once: bool,
+    live: bool,
+    policies: ConductorPolicies,
+    reasoner: R,
+) -> Result<()> {
     let mut watcher = Watcher::new(
         profile.to_string(),
         reasoner,
-        Duration::from_secs(args.poll_interval),
+        Duration::from_secs(poll_interval_secs),
     );
     if let Some(window) = policies.quiet_hours {
         watcher = watcher.with_quiet_hours(window);
     }
-    if args.live {
+    if live {
         watcher = watcher.with_executor(Executor::new(profile.to_string(), policies.clone()));
     }
 
-    if args.once {
+    if once {
         let recs = watcher.tick().await?;
-        if args.live {
+        if live {
             let outcomes = Executor::new(profile.to_string(), policies).dispatch(&recs)?;
             println!("{}", serde_json::to_string_pretty(&outcomes)?);
         } else {

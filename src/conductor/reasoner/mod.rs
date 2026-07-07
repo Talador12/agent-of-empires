@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub mod claude_print;
+pub mod opencode;
 
 /// Snapshot of the fleet the reasoner sees on one tick. Kept lean here; the
 /// intelligence-module port (later commits) enriches it with health scores,

@@ -75,8 +75,10 @@ impl Reasoner for ClaudePrintReasoner {
 
 /// Extract and parse the JSON envelope. LLMs occasionally wrap responses
 /// in ``` fences or trailing prose even when told not to; the extractor
-/// pulls the first top-level `{...}` block out before parsing.
-fn parse_recommendations(raw: &str) -> Result<Vec<Recommendation>> {
+/// pulls the first top-level `{...}` block out before parsing. Shared
+/// with the OpenCode backend since both models are prompted to return
+/// the same envelope shape.
+pub(super) fn parse_recommendations(raw: &str) -> Result<Vec<Recommendation>> {
     #[derive(serde::Deserialize)]
     struct Envelope {
         recommendations: Vec<Recommendation>,
