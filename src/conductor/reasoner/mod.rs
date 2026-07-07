@@ -67,10 +67,10 @@ pub struct Observation {
     pub sessions: Vec<SessionSnapshot>,
 }
 
-/// Per-session projection fed to the reasoner. Fields mirror the subset of
-/// `Instance` state the LLM needs to make a recommendation. Everything is
-/// derived from durable session state, so a fresh reasoner call after a
-/// restart produces the same output.
+/// Per-session projection fed to the reasoner. Fields on the top half are
+/// derived from durable `Instance` state; the `activity`, `sentiment`,
+/// `error_match`, `goal_completed`, and `unchanged_ticks` block comes from
+/// content-derived signals classified from the pane output.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionSnapshot {
     pub id: String,
@@ -84,6 +84,24 @@ pub struct SessionSnapshot {
     pub snoozed_until: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_accessed_at: Option<DateTime<Utc>>,
+
+    // Content-derived signals from `crate::conductor::{signals, errors, goals, heartbeat}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<super::signals::Activity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sentiment: Option<super::signals::Sentiment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_match: Option<super::errors::ErrorMatch>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub goal_completed: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unchanged_ticks: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub potentially_stuck: bool,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// One action the reasoner suggests. The executor is what actually
@@ -230,6 +248,12 @@ mod tests {
             archived: false,
             snoozed_until: None,
             last_accessed_at: None,
+            activity: None,
+            sentiment: None,
+            error_match: None,
+            goal_completed: false,
+            unchanged_ticks: 0,
+            potentially_stuck: false,
         };
         let json = serde_json::to_string(&snap).unwrap();
         assert!(!json.contains("snoozed_until"));

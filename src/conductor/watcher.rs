@@ -7,8 +7,11 @@ use anyhow::Result;
 use tokio::select;
 use tokio::sync::oneshot;
 
+use std::sync::Arc;
+
 use super::executor::{Executor, Outcome};
-use super::observation::build_observation;
+use super::heartbeat::HeartbeatTracker;
+use super::observation::build_observation_with_signals;
 use super::policies::QuietHours;
 use super::reasoner::{Reasoner, Recommendation};
 use crate::session::Storage;
@@ -32,6 +35,9 @@ pub struct Watcher<R: Reasoner> {
     /// When set, the tick loop skips reasoning during this daily window.
     /// Ports aoaoe's `quietHours`.
     quiet_hours: Option<QuietHours>,
+    /// Persistent per-session output-hash tracker. Shared across every
+    /// tick so `potentially_stuck` observes across time, not per tick.
+    heartbeat: Arc<HeartbeatTracker>,
 }
 
 impl<R: Reasoner> Watcher<R> {
@@ -42,6 +48,7 @@ impl<R: Reasoner> Watcher<R> {
             poll_interval: poll_interval.max(MIN_POLL_INTERVAL),
             executor: None,
             quiet_hours: None,
+            heartbeat: Arc::new(HeartbeatTracker::new()),
         }
     }
 
@@ -70,7 +77,7 @@ impl<R: Reasoner> Watcher<R> {
         for inst in &mut instances {
             inst.update_status();
         }
-        let observation = build_observation(&instances);
+        let observation = build_observation_with_signals(&instances, Some(&self.heartbeat));
         self.reasoner.recommend(&observation).await
     }
 

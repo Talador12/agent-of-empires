@@ -6,12 +6,16 @@ use chrono::Utc;
 
 use crate::session::{Instance, Status};
 
+pub mod errors;
 pub mod executor;
 pub mod github;
+pub mod goals;
+pub mod heartbeat;
 pub mod intelligence;
 pub mod observation;
 pub mod policies;
 pub mod reasoner;
+pub mod signals;
 pub mod watcher;
 
 /// Env var that gates every conductor surface. Absent or set to `0` / `false`

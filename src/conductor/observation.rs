@@ -1,16 +1,55 @@
 //! Project a fleet of `Instance`s into the `Observation` the reasoner
-//! sees. Skips the same rows `attention_score` skips.
+//! sees. Optionally attaches content-derived signals (activity, sentiment,
+//! error match, goal completion, heartbeat) when a `HeartbeatTracker` is
+//! provided; otherwise ships a lean snapshot without touching tmux.
 
 use chrono::Utc;
 
-use super::{attention_score, reasoner::Observation, reasoner::SessionSnapshot};
+use super::heartbeat::HeartbeatTracker;
+use super::{
+    attention_score, errors::match_error, goals::goal_completed, reasoner::Observation,
+    reasoner::SessionSnapshot, signals::classify_activity, signals::classify_sentiment,
+};
 use crate::session::Instance;
 
+/// Number of tail lines to grab from each pane. Enough for the signal
+/// classifiers to hit their tokens, cheap enough to invoke every tick.
+const PANE_TAIL_LINES: usize = 200;
+
+/// Build an observation with no pane-content signals. Used by the
+/// read-only surfaces (`aoe conductor status`, the TUI panel, the web
+/// endpoint) so they stay snappy and don't spawn tmux per row.
 pub fn build_observation(instances: &[Instance]) -> Observation {
+    build_observation_with_signals(instances, None)
+}
+
+/// Build an observation with content-derived signals. The watcher uses
+/// this on live ticks so the reasoner sees enough to detect stuck
+/// sessions and match errors.
+pub fn build_observation_with_signals(
+    instances: &[Instance],
+    tracker: Option<&HeartbeatTracker>,
+) -> Observation {
     let sessions: Vec<SessionSnapshot> = instances
         .iter()
         .filter_map(|inst| {
             let score = attention_score(inst)?;
+            let (activity, sentiment, error_match, goal_complete, heartbeat) = match tracker {
+                Some(tracker) => match capture_pane(inst) {
+                    Some(pane) => {
+                        let hb = tracker.observe(&inst.id, &pane);
+                        (
+                            Some(classify_activity(&pane)),
+                            Some(classify_sentiment(&pane)),
+                            match_error(&pane),
+                            goal_completed(&pane),
+                            Some(hb),
+                        )
+                    }
+                    None => (None, None, None, false, None),
+                },
+                None => (None, None, None, false, None),
+            };
             Some(SessionSnapshot {
                 id: inst.id.clone(),
                 title: inst.title.clone(),
@@ -21,13 +60,29 @@ pub fn build_observation(instances: &[Instance]) -> Observation {
                 archived: false,
                 snoozed_until: inst.snoozed_until,
                 last_accessed_at: inst.last_accessed_at,
+                activity,
+                sentiment,
+                error_match,
+                goal_completed: goal_complete,
+                unchanged_ticks: heartbeat.map(|h| h.unchanged_ticks).unwrap_or(0),
+                potentially_stuck: heartbeat.map(|h| h.potentially_stuck).unwrap_or(false),
             })
         })
         .collect();
+    if let Some(tracker) = tracker {
+        let live: std::collections::HashSet<String> =
+            sessions.iter().map(|s| s.id.clone()).collect();
+        tracker.retain(|id| live.contains(id));
+    }
     Observation {
         captured_at: Utc::now(),
         sessions,
     }
+}
+
+fn capture_pane(inst: &Instance) -> Option<String> {
+    let session = crate::tmux::Session::new(&inst.id, &inst.title).ok()?;
+    session.capture_pane(PANE_TAIL_LINES).ok()
 }
 
 #[cfg(test)]
