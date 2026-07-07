@@ -1454,6 +1454,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         // handler, not the router, so the client can call it and get a
         // structured 403 with the opt-in hint.
         .route("/api/conductor/state", get(api::get_conductor_state))
+        .route("/api/conductor/health", get(api::get_conductor_health))
+        .route("/api/conductor/tasks", get(api::list_conductor_tasks))
+        .route("/api/conductor/tick", post(api::post_conductor_tick))
+        .route("/api/conductor/action", post(api::post_conductor_action))
         // Sessions
         .route(
             "/api/sessions",

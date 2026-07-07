@@ -35,7 +35,10 @@ pub use acp::{
 
 #[cfg(feature = "serve")]
 pub use client_log::post_client_log;
-pub use conductor::get_conductor_state;
+pub use conductor::{
+    get_conductor_health, get_conductor_state, list_conductor_tasks, post_conductor_action,
+    post_conductor_tick,
+};
 pub use git::{clone_repo, is_git_repo, list_branches};
 pub use log_level::{get_log_level, patch_log_level};
 pub use mcp::{drop_mcp_server, get_mcp_servers, keep_mcp_server, resolve_mcp_conflict};
