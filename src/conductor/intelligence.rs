@@ -1,7 +1,6 @@
 //! Ports of aoaoe's pure-computation intelligence modules that map onto
 //! `Instance` state without needing session output content.
 
-use std::collections::HashSet;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -129,28 +128,6 @@ impl SessionPool {
         let active = fleet.iter().filter(|i| is_active(i)).count();
         self.limit.saturating_sub(active)
     }
-
-    /// Filter a set of intended new-session ids down to the ones that
-    /// still fit under the cap. Preserves input order so the caller can
-    /// use it directly.
-    pub fn filter_to_capacity(
-        &self,
-        fleet: &[Instance],
-        intended: impl IntoIterator<Item = String>,
-    ) -> Vec<String> {
-        let slots = self.slots_remaining(fleet);
-        let mut kept: Vec<String> = Vec::with_capacity(slots);
-        let mut seen: HashSet<String> = HashSet::new();
-        for id in intended {
-            if kept.len() >= slots {
-                break;
-            }
-            if seen.insert(id.clone()) {
-                kept.push(id);
-            }
-        }
-        kept
-    }
 }
 
 fn is_active(inst: &Instance) -> bool {
@@ -242,20 +219,9 @@ mod tests {
     }
 
     #[test]
-    fn pool_filter_respects_limit_and_dedupes() {
-        let fleet = vec![active("a"), active("b")];
-        let pool = SessionPool::new(3);
-        let intended = ["x", "y", "z", "x", "w"].iter().map(|s| s.to_string());
-        let kept = pool.filter_to_capacity(&fleet, intended);
-        assert_eq!(kept, vec!["x".to_string()]);
-    }
-
-    #[test]
     fn pool_at_limit_returns_empty_slots() {
         let fleet = vec![active("a"), active("b"), active("c")];
         let pool = SessionPool::new(3);
         assert_eq!(pool.slots_remaining(&fleet), 0);
-        let intended = ["x"].iter().map(|s| s.to_string());
-        assert!(pool.filter_to_capacity(&fleet, intended).is_empty());
     }
 }

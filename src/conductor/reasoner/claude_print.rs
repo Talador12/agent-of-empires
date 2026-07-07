@@ -58,9 +58,12 @@ pub(super) fn build_system_prompt(mode: ReasonerMode) -> String {
             "potentially_stuck flag is a strong nudge/start hint, goal_completed is ",
             "a strong archive/no_op hint. ",
             "Valid action kinds: snooze (with minutes: integer), favorite, unfavorite, archive, ",
-            "nudge (with message: string), start_session, stop_session, no_op. ",
+            "nudge (with message: string), start_session, stop_session, ",
+            "report_progress (with task_id: string, note: string), ",
+            "complete_task (with task_id: string), no_op. ",
             "Archive and stop_session are destructive; nudge is disruptive. ",
             "Each only takes effect if the user has opted in via the matching policy. ",
+            "report_progress and complete_task refer to `TaskStore` entries; use them to keep task state in sync with observable outcomes. ",
             "{}"
         ),
         mode.posture_line()
@@ -156,10 +159,12 @@ mod tests {
             {"session_id":"e","action":{"kind":"nudge","message":"still there?"},"rationale":""},
             {"session_id":"f","action":{"kind":"start_session"},"rationale":""},
             {"session_id":"g","action":{"kind":"stop_session"},"rationale":""},
-            {"session_id":"h","action":{"kind":"no_op"},"rationale":""}
+            {"session_id":"h","action":{"kind":"report_progress","task_id":"t1","note":"wrote tests"},"rationale":""},
+            {"session_id":"i","action":{"kind":"complete_task","task_id":"t1"},"rationale":""},
+            {"session_id":"j","action":{"kind":"no_op"},"rationale":""}
         ]}"#;
         let recs = parse_recommendations(json).unwrap();
-        assert_eq!(recs.len(), 8);
+        assert_eq!(recs.len(), 10);
         assert_eq!(recs[0].action, Action::Snooze { minutes: 10 });
         assert_eq!(recs[1].action, Action::Favorite);
         assert_eq!(recs[2].action, Action::Unfavorite);
@@ -172,7 +177,20 @@ mod tests {
         );
         assert_eq!(recs[5].action, Action::StartSession);
         assert_eq!(recs[6].action, Action::StopSession);
-        assert_eq!(recs[7].action, Action::NoOp);
+        assert_eq!(
+            recs[7].action,
+            Action::ReportProgress {
+                task_id: "t1".into(),
+                note: "wrote tests".into()
+            }
+        );
+        assert_eq!(
+            recs[8].action,
+            Action::CompleteTask {
+                task_id: "t1".into()
+            }
+        );
+        assert_eq!(recs[9].action, Action::NoOp);
     }
 
     #[test]
