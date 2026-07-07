@@ -1,8 +1,13 @@
 //! Apply reasoner recommendations to real session state. Loads the fleet,
 //! mutates the matching `Instance` via the attention-stack primitives on
-//! it (`snooze`, `favorite`, `unfavorite`), and writes atomically through
-//! `Storage::update`. Nothing here talks to tmux or an agent process yet;
-//! nudge lands with the send-input pipe in a later commit.
+//! it (`snooze`, `favorite`, `unfavorite`, `archive`), and writes
+//! atomically through `Storage::update`. Nothing here talks to tmux or
+//! an agent process yet; nudge lands with the send-input pipe in a later
+//! commit.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Instant;
 
 use anyhow::Result;
 use serde::Serialize;
@@ -14,6 +19,12 @@ use crate::session::Storage;
 pub struct Executor {
     profile: String,
     policies: ConductorPolicies,
+    /// Per-session timestamp of the last action the executor applied.
+    /// Consulted to enforce `policies.action_cooldown`; blocks
+    /// recommendations that arrive too fast. Interior mutability so the
+    /// executor can be shared behind an immutable reference without a
+    /// `&mut self` on every call site.
+    last_action_at: Mutex<HashMap<String, Instant>>,
 }
 
 /// What happened to a single recommendation. Reported back to callers so
@@ -50,6 +61,7 @@ impl Executor {
         Self {
             profile: profile.into(),
             policies,
+            last_action_at: Mutex::new(HashMap::new()),
         }
     }
 
@@ -66,13 +78,37 @@ impl Executor {
         let recs_owned: Vec<Recommendation> = recs.to_vec();
         let policies = self.policies.clone();
 
-        storage.update(|instances, _groups| {
+        // Snapshot the cooldown map so decisions inside the storage
+        // closure are consistent, then commit the fresh timestamps after
+        // the write succeeds. This keeps the closure free of the
+        // executor's internal locks.
+        let cooldown_snapshot: HashMap<String, Instant> = self
+            .last_action_at
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+
+        let outcomes = storage.update(|instances, _groups| {
             let mut outcomes = Vec::with_capacity(recs_owned.len());
             for rec in &recs_owned {
-                outcomes.push(apply_one(instances, rec, &policies));
+                outcomes.push(apply_one(instances, rec, &policies, &cooldown_snapshot));
             }
             Ok(outcomes)
-        })
+        })?;
+
+        // Only bump the cooldown map for outcomes that actually mutated
+        // state. Blocked / NoOp / UnknownSession do not count against
+        // the cooldown, since the user's intent was not applied.
+        let now = Instant::now();
+        if let Ok(mut guard) = self.last_action_at.lock() {
+            for outcome in &outcomes {
+                if let Outcome::Applied { session_id, .. } = outcome {
+                    guard.insert(session_id.clone(), now);
+                }
+            }
+        }
+
+        Ok(outcomes)
     }
 }
 
@@ -80,11 +116,28 @@ fn apply_one(
     instances: &mut [crate::session::Instance],
     rec: &Recommendation,
     policies: &ConductorPolicies,
+    cooldown_snapshot: &HashMap<String, Instant>,
 ) -> Outcome {
     if matches!(rec.action, Action::NoOp) {
         return Outcome::NoOp {
             session_id: rec.session_id.clone(),
         };
+    }
+
+    // Cooldown check runs before the fleet lookup so a Blocked-by-cooldown
+    // outcome reports even if the session was deleted since the tick that
+    // recommended it. `elapsed >= cooldown` allows the very first action.
+    if let Some(last) = cooldown_snapshot.get(&rec.session_id) {
+        if last.elapsed() < policies.action_cooldown {
+            return Outcome::Blocked {
+                session_id: rec.session_id.clone(),
+                action: rec.action.clone(),
+                reason: format!(
+                    "action_cooldown ({}s) not yet elapsed",
+                    policies.action_cooldown.as_secs()
+                ),
+            };
+        }
     }
 
     let Some(inst) = instances.iter_mut().find(|i| i.id == rec.session_id) else {
@@ -113,6 +166,21 @@ fn apply_one(
             Outcome::Applied {
                 session_id: rec.session_id.clone(),
                 action: rec.action.clone(),
+            }
+        }
+        Action::Archive => {
+            if !policies.allow_destructive {
+                Outcome::Blocked {
+                    session_id: rec.session_id.clone(),
+                    action: rec.action.clone(),
+                    reason: "policies.allow_destructive is off".into(),
+                }
+            } else {
+                inst.archive();
+                Outcome::Applied {
+                    session_id: rec.session_id.clone(),
+                    action: rec.action.clone(),
+                }
             }
         }
         Action::Nudge { .. } => {
@@ -156,6 +224,10 @@ mod tests {
         i
     }
 
+    fn empty_cooldown() -> HashMap<String, Instant> {
+        HashMap::new()
+    }
+
     #[test]
     fn no_op_shortcircuits_without_session() {
         let mut fleet: Vec<Instance> = vec![];
@@ -163,6 +235,7 @@ mod tests {
             &mut fleet,
             &rec("ghost", Action::NoOp),
             &ConductorPolicies::default(),
+            &empty_cooldown(),
         );
         assert!(matches!(out, Outcome::NoOp { .. }));
     }
@@ -174,6 +247,7 @@ mod tests {
             &mut fleet,
             &rec("b", Action::Favorite),
             &ConductorPolicies::default(),
+            &empty_cooldown(),
         );
         assert!(matches!(out, Outcome::UnknownSession { .. }));
     }
@@ -185,6 +259,7 @@ mod tests {
             &mut fleet,
             &rec("a", Action::Favorite),
             &ConductorPolicies::default(),
+            &empty_cooldown(),
         );
         assert!(matches!(out, Outcome::Applied { .. }));
         assert!(fleet[0].favorited_at.is_some());
@@ -197,6 +272,7 @@ mod tests {
             &mut fleet,
             &rec("a", Action::Snooze { minutes: 30 }),
             &ConductorPolicies::default(),
+            &empty_cooldown(),
         );
         assert!(matches!(out, Outcome::Applied { .. }));
         assert!(fleet[0].snoozed_until.is_some());
@@ -210,9 +286,43 @@ mod tests {
             &mut fleet,
             &rec("a", Action::Unfavorite),
             &ConductorPolicies::default(),
+            &empty_cooldown(),
         );
         assert!(matches!(out, Outcome::Applied { .. }));
         assert!(fleet[0].favorited_at.is_none());
+    }
+
+    #[test]
+    fn archive_blocked_when_policy_off() {
+        let mut fleet = vec![inst("a")];
+        let out = apply_one(
+            &mut fleet,
+            &rec("a", Action::Archive),
+            &ConductorPolicies::default(),
+            &empty_cooldown(),
+        );
+        match out {
+            Outcome::Blocked { reason, .. } => {
+                assert!(reason.contains("allow_destructive"));
+            }
+            _ => panic!("expected Blocked"),
+        }
+        assert!(fleet[0].archived_at.is_none());
+    }
+
+    #[test]
+    fn archive_applied_when_opted_in() {
+        let mut fleet = vec![inst("a")];
+        let mut policies = ConductorPolicies::default();
+        policies.allow_destructive = true;
+        let out = apply_one(
+            &mut fleet,
+            &rec("a", Action::Archive),
+            &policies,
+            &empty_cooldown(),
+        );
+        assert!(matches!(out, Outcome::Applied { .. }));
+        assert!(fleet[0].archived_at.is_some());
     }
 
     #[test]
@@ -227,6 +337,7 @@ mod tests {
                 },
             ),
             &ConductorPolicies::default(),
+            &empty_cooldown(),
         );
         match out {
             Outcome::Blocked { reason, .. } => {
@@ -239,10 +350,8 @@ mod tests {
     #[test]
     fn nudge_blocked_when_opted_in_pending_impl() {
         let mut fleet = vec![inst("a")];
-        let policies = ConductorPolicies {
-            allow_destructive: false,
-            allow_nudge: true,
-        };
+        let mut policies = ConductorPolicies::default();
+        policies.allow_nudge = true;
         let out = apply_one(
             &mut fleet,
             &rec(
@@ -252,6 +361,7 @@ mod tests {
                 },
             ),
             &policies,
+            &empty_cooldown(),
         );
         match out {
             Outcome::Blocked { reason, .. } => {
@@ -259,5 +369,38 @@ mod tests {
             }
             _ => panic!("expected Blocked pending implementation"),
         }
+    }
+
+    #[test]
+    fn cooldown_blocks_repeat_actions() {
+        let mut fleet = vec![inst("a")];
+        let mut cooldown = HashMap::new();
+        cooldown.insert("a".to_string(), Instant::now());
+        let out = apply_one(
+            &mut fleet,
+            &rec("a", Action::Favorite),
+            &ConductorPolicies::default(),
+            &cooldown,
+        );
+        match out {
+            Outcome::Blocked { reason, .. } => {
+                assert!(reason.contains("action_cooldown"));
+            }
+            _ => panic!("expected Blocked by cooldown"),
+        }
+        // Instance was not mutated.
+        assert!(fleet[0].favorited_at.is_none());
+    }
+
+    #[test]
+    fn cooldown_allows_first_action() {
+        let mut fleet = vec![inst("a")];
+        let out = apply_one(
+            &mut fleet,
+            &rec("a", Action::Favorite),
+            &ConductorPolicies::default(),
+            &empty_cooldown(),
+        );
+        assert!(matches!(out, Outcome::Applied { .. }));
     }
 }

@@ -11,8 +11,10 @@ use tokio::sync::oneshot;
 
 use super::executor::{Executor, Outcome};
 use super::observation::build_observation;
+use super::policies::QuietHours;
 use super::reasoner::{Reasoner, Recommendation};
 use crate::session::Storage;
+use chrono::{Local, Timelike};
 
 /// Minimum poll interval accepted from the CLI. Prevents runaway subprocess
 /// spawns if a user typos `--poll-interval 0`.
@@ -29,6 +31,9 @@ pub struct Watcher<R: Reasoner> {
     /// When `Some`, recommendations are dispatched through the executor
     /// (live mode). When `None`, they are only logged (dry-run mode).
     executor: Option<Executor>,
+    /// When set, the tick loop skips reasoning during this daily window.
+    /// Ports aoaoe's `quietHours`.
+    quiet_hours: Option<QuietHours>,
 }
 
 impl<R: Reasoner> Watcher<R> {
@@ -38,6 +43,7 @@ impl<R: Reasoner> Watcher<R> {
             reasoner,
             poll_interval: poll_interval.max(MIN_POLL_INTERVAL),
             executor: None,
+            quiet_hours: None,
         }
     }
 
@@ -45,6 +51,14 @@ impl<R: Reasoner> Watcher<R> {
     /// each tick instead of being logged as dry-run.
     pub fn with_executor(mut self, executor: Executor) -> Self {
         self.executor = Some(executor);
+        self
+    }
+
+    /// Set the daily quiet-hours window during which reasoning is
+    /// skipped. The watcher still wakes each `poll_interval`; it just
+    /// short-circuits before spawning the reasoner subprocess.
+    pub fn with_quiet_hours(mut self, quiet_hours: QuietHours) -> Self {
+        self.quiet_hours = Some(quiet_hours);
         self
     }
 
@@ -73,17 +87,23 @@ impl<R: Reasoner> Watcher<R> {
             "conductor watch started"
         );
         loop {
-            match self.tick().await {
-                Ok(recs) => {
-                    log_recommendations(&recs);
-                    if let Some(executor) = &self.executor {
-                        match executor.dispatch(&recs) {
-                            Ok(outcomes) => log_outcomes(&outcomes),
-                            Err(err) => tracing::warn!(error = %err, "conductor dispatch failed"),
+            if self.in_quiet_hours() {
+                tracing::debug!("conductor tick skipped: quiet hours");
+            } else {
+                match self.tick().await {
+                    Ok(recs) => {
+                        log_recommendations(&recs);
+                        if let Some(executor) = &self.executor {
+                            match executor.dispatch(&recs) {
+                                Ok(outcomes) => log_outcomes(&outcomes),
+                                Err(err) => {
+                                    tracing::warn!(error = %err, "conductor dispatch failed")
+                                }
+                            }
                         }
                     }
+                    Err(err) => tracing::warn!(error = %err, "conductor tick failed"),
                 }
-                Err(err) => tracing::warn!(error = %err, "conductor tick failed"),
             }
             select! {
                 _ = tokio::time::sleep(self.poll_interval) => {}
@@ -93,6 +113,15 @@ impl<R: Reasoner> Watcher<R> {
                 }
             }
         }
+    }
+
+    fn in_quiet_hours(&self) -> bool {
+        let Some(window) = self.quiet_hours else {
+            return false;
+        };
+        let now = Local::now();
+        let minute_of_day = now.hour() * 60 + now.minute();
+        window.contains(minute_of_day)
     }
 }
 

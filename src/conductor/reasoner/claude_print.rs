@@ -17,9 +17,10 @@ const DEFAULT_SYSTEM_PROMPT: &str = concat!(
     "Given an observation of the fleet, recommend actions that keep work moving. ",
     "Reply with a single JSON object and nothing else: ",
     "{\"recommendations\": [{\"session_id\": \"...\", \"action\": {\"kind\": \"...\"}, \"rationale\": \"...\"}]}. ",
-    "Valid action kinds: snooze (with minutes: integer), favorite, unfavorite, ",
+    "Valid action kinds: snooze (with minutes: integer), favorite, unfavorite, archive, ",
     "nudge (with message: string), no_op. ",
-    "Be conservative. Prefer no_op when nothing is clearly needed."
+    "Be conservative. Prefer no_op when nothing is clearly needed. ",
+    "Archive is destructive and only takes effect if the user has opted in."
 );
 
 /// Reasoner that spawns `claude --print` per tick with the observation as
@@ -122,21 +123,23 @@ mod tests {
             {"session_id":"a","action":{"kind":"snooze","minutes":10},"rationale":""},
             {"session_id":"b","action":{"kind":"favorite"},"rationale":""},
             {"session_id":"c","action":{"kind":"unfavorite"},"rationale":""},
-            {"session_id":"d","action":{"kind":"nudge","message":"still there?"},"rationale":""},
-            {"session_id":"e","action":{"kind":"no_op"},"rationale":""}
+            {"session_id":"d","action":{"kind":"archive"},"rationale":""},
+            {"session_id":"e","action":{"kind":"nudge","message":"still there?"},"rationale":""},
+            {"session_id":"f","action":{"kind":"no_op"},"rationale":""}
         ]}"#;
         let recs = parse_recommendations(json).unwrap();
-        assert_eq!(recs.len(), 5);
+        assert_eq!(recs.len(), 6);
         assert_eq!(recs[0].action, Action::Snooze { minutes: 10 });
         assert_eq!(recs[1].action, Action::Favorite);
         assert_eq!(recs[2].action, Action::Unfavorite);
+        assert_eq!(recs[3].action, Action::Archive);
         assert_eq!(
-            recs[3].action,
+            recs[4].action,
             Action::Nudge {
                 message: "still there?".into()
             }
         );
-        assert_eq!(recs[4].action, Action::NoOp);
+        assert_eq!(recs[5].action, Action::NoOp);
     }
 
     #[test]

@@ -16,7 +16,7 @@ use tokio::sync::oneshot;
 use crate::conductor::executor::Executor;
 use crate::conductor::github::{fetch_issues, session_title_for_issue};
 use crate::conductor::intelligence::{Backoff, SessionPool};
-use crate::conductor::policies::ConductorPolicies;
+use crate::conductor::policies::{ConductorPolicies, QuietHours};
 use crate::conductor::reasoner::claude_print::ClaudePrintReasoner;
 use crate::conductor::watcher::{Watcher, DEFAULT_POLL_INTERVAL};
 use crate::conductor::{self};
@@ -69,8 +69,8 @@ pub struct ConductorWatchArgs {
 
     /// Actually apply recommended actions to session state. Off by default
     /// so a first-time run is safe: recommendations are logged, not
-    /// executed. `Nudge` remains blocked even in live mode unless
-    /// `--allow-nudge` is also set.
+    /// executed. `Nudge` and `Archive` remain blocked in live mode unless
+    /// their opt-in flags are also set.
     #[arg(long)]
     pub live: bool,
 
@@ -78,6 +78,22 @@ pub struct ConductorWatchArgs {
     /// session's agent). No effect without `--live`.
     #[arg(long)]
     pub allow_nudge: bool,
+
+    /// Opt in to `Archive` actions (moving a session out of the active
+    /// view). No effect without `--live`.
+    #[arg(long)]
+    pub allow_destructive: bool,
+
+    /// Minimum seconds between successive actions on the same session.
+    /// Ports aoaoe's `actionCooldownMs`.
+    #[arg(long, default_value_t = 30)]
+    pub action_cooldown_secs: u64,
+
+    /// Skip reasoning during this daily window, `HH:MM-HH:MM` in the
+    /// daemon's local timezone. Wraps around midnight. Ports aoaoe's
+    /// `quietHours`.
+    #[arg(long)]
+    pub quiet_hours: Option<String>,
 }
 
 #[derive(Args)]
@@ -285,6 +301,17 @@ async fn spawn_one(
 }
 
 async fn watch(profile: &str, args: ConductorWatchArgs) -> Result<()> {
+    let quiet_hours = match args.quiet_hours.as_deref() {
+        Some(spec) => Some(QuietHours::parse(spec).context("--quiet-hours")?),
+        None => None,
+    };
+    let policies = ConductorPolicies {
+        allow_destructive: args.allow_destructive,
+        allow_nudge: args.allow_nudge,
+        action_cooldown: Duration::from_secs(args.action_cooldown_secs),
+        quiet_hours,
+    };
+
     let reasoner = match args.reasoner_binary {
         Some(bin) => ClaudePrintReasoner::with_binary(bin),
         None => ClaudePrintReasoner::default(),
@@ -294,21 +321,16 @@ async fn watch(profile: &str, args: ConductorWatchArgs) -> Result<()> {
         reasoner,
         Duration::from_secs(args.poll_interval),
     );
+    if let Some(window) = policies.quiet_hours {
+        watcher = watcher.with_quiet_hours(window);
+    }
     if args.live {
-        let policies = ConductorPolicies {
-            allow_destructive: false,
-            allow_nudge: args.allow_nudge,
-        };
-        watcher = watcher.with_executor(Executor::new(profile.to_string(), policies));
+        watcher = watcher.with_executor(Executor::new(profile.to_string(), policies.clone()));
     }
 
     if args.once {
         let recs = watcher.tick().await?;
         if args.live {
-            let policies = ConductorPolicies {
-                allow_destructive: false,
-                allow_nudge: args.allow_nudge,
-            };
             let outcomes = Executor::new(profile.to_string(), policies).dispatch(&recs)?;
             println!("{}", serde_json::to_string_pretty(&outcomes)?);
         } else {

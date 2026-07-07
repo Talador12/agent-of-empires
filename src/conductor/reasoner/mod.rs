@@ -51,8 +51,8 @@ pub struct Recommendation {
 }
 
 /// The set of actions the reasoner is allowed to suggest. Deliberately
-/// small so the LLM has a closed vocabulary. Later commits widen this as
-/// each executor path lands (nudge messaging, archive/unarchive, etc.).
+/// small so the LLM has a closed vocabulary. Widened as each executor
+/// path lands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Action {
@@ -62,6 +62,10 @@ pub enum Action {
     Favorite,
     /// Remove the favorite pin.
     Unfavorite,
+    /// Move the session out of the active view. Sinks to the archived
+    /// bucket, hidden from every non-archived surface. Gated by
+    /// `ConductorPolicies::allow_destructive`.
+    Archive,
     /// Send a nudge message to the session's agent. Executor support lands
     /// with the send-input policy in a later commit; the reasoner is
     /// allowed to suggest it now so the JSON vocabulary is stable.
