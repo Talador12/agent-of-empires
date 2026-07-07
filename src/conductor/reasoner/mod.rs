@@ -9,6 +9,54 @@ use serde::{Deserialize, Serialize};
 pub mod claude_print;
 pub mod opencode;
 
+/// How aggressively the reasoner should recommend actions. Ports aoaoe's
+/// `promptTemplate` mode selection. Each variant selects a system prompt
+/// that shapes the model's default posture; the closed action vocabulary
+/// is identical across modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReasonerMode {
+    /// Prefer `no_op` unless action is clearly needed.
+    Conservative,
+    /// Recommend actions when they would materially help. Default.
+    #[default]
+    Balanced,
+    /// Actively suggest actions to keep sessions moving.
+    Aggressive,
+}
+
+impl ReasonerMode {
+    /// Parse the string form used by the CLI (`--mode <mode>`). Named
+    /// `from_cli` rather than `from_str` to keep clippy's
+    /// `should_implement_trait` quiet without implementing `FromStr` (the
+    /// `--mode` clap parser is already the value_parser).
+    pub fn from_cli(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "conservative" => Ok(Self::Conservative),
+            "balanced" => Ok(Self::Balanced),
+            "aggressive" => Ok(Self::Aggressive),
+            _ => anyhow::bail!(
+                "unknown --mode {:?}; expected conservative|balanced|aggressive",
+                s
+            ),
+        }
+    }
+
+    /// Postural instruction folded into the system prompt.
+    pub fn posture_line(self) -> &'static str {
+        match self {
+            Self::Conservative => {
+                "Prefer no_op. Only suggest actions when the fleet clearly needs them."
+            }
+            Self::Balanced => {
+                "Recommend actions when they would materially help. Use no_op when in doubt."
+            }
+            Self::Aggressive => {
+                "Actively surface actions that would keep sessions moving. Explain each one."
+            }
+        }
+    }
+}
+
 /// Snapshot of the fleet the reasoner sees on one tick. Kept lean here; the
 /// intelligence-module port (later commits) enriches it with health scores,
 /// error-pattern hits, and idle-detection signals without changing the
@@ -38,14 +86,20 @@ pub struct SessionSnapshot {
     pub last_accessed_at: Option<DateTime<Utc>>,
 }
 
-/// One action the reasoner suggests. The executor (commit 4) is what
-/// actually mutates session state; the reasoner never touches disk.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One action the reasoner suggests. The executor is what actually
+/// mutates session state; the reasoner never touches disk.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Recommendation {
     pub session_id: String,
     pub action: Action,
     /// One-line human-readable rationale from the LLM.
     pub rationale: String,
+    /// Optional model-reported confidence, `0.0..=1.0`. Ports aoaoe's
+    /// low/high-confidence markers from `parse.ts`. Emitted through the
+    /// tick log so a reviewer can spot low-confidence actions after the
+    /// fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
 }
 
 /// The set of actions the reasoner is allowed to suggest. Deliberately
@@ -119,12 +173,39 @@ mod tests {
             session_id: "abc".into(),
             action: Action::NoOp,
             rationale: "nothing to do".into(),
+            confidence: None,
         };
         let stub = StubReasoner {
             canned: vec![rec.clone()],
         };
         let out = stub.recommend(&empty_observation()).await.unwrap();
         assert_eq!(out, vec![rec]);
+    }
+
+    #[test]
+    fn mode_parses_known_labels() {
+        assert_eq!(
+            ReasonerMode::from_cli("conservative").unwrap(),
+            ReasonerMode::Conservative
+        );
+        assert_eq!(
+            ReasonerMode::from_cli("balanced").unwrap(),
+            ReasonerMode::Balanced
+        );
+        assert_eq!(
+            ReasonerMode::from_cli("aggressive").unwrap(),
+            ReasonerMode::Aggressive
+        );
+    }
+
+    #[test]
+    fn mode_rejects_unknown_label() {
+        assert!(ReasonerMode::from_cli("YOLO").is_err());
+    }
+
+    #[test]
+    fn mode_default_is_balanced() {
+        assert_eq!(ReasonerMode::default(), ReasonerMode::Balanced);
     }
 
     #[test]

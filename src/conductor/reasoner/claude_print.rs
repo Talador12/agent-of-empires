@@ -4,21 +4,7 @@
 use anyhow::{Context, Result};
 use tokio::process::Command;
 
-use super::{Observation, Reasoner, Recommendation};
-
-/// Default system prompt handed to the model. Constrains the response to
-/// a JSON envelope with a closed action vocabulary so the parser is
-/// deterministic. See `parse_recommendations` for the envelope shape.
-const DEFAULT_SYSTEM_PROMPT: &str = concat!(
-    "You are the conductor for a fleet of AI coding agent sessions. ",
-    "Given an observation of the fleet, recommend actions that keep work moving. ",
-    "Reply with a single JSON object and nothing else: ",
-    "{\"recommendations\": [{\"session_id\": \"...\", \"action\": {\"kind\": \"...\"}, \"rationale\": \"...\"}]}. ",
-    "Valid action kinds: snooze (with minutes: integer), favorite, unfavorite, archive, ",
-    "nudge (with message: string), no_op. ",
-    "Be conservative. Prefer no_op when nothing is clearly needed. ",
-    "Archive is destructive and only takes effect if the user has opted in."
-);
+use super::{Observation, Reasoner, ReasonerMode, Recommendation};
 
 /// Reasoner that spawns `claude --print` per tick with the observation as
 /// the prompt payload.
@@ -29,20 +15,47 @@ pub struct ClaudePrintReasoner {
 
 impl Default for ClaudePrintReasoner {
     fn default() -> Self {
-        Self {
-            binary: "claude".to_string(),
-            system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
-        }
+        Self::for_mode(ReasonerMode::default())
     }
 }
 
 impl ClaudePrintReasoner {
+    pub fn for_mode(mode: ReasonerMode) -> Self {
+        Self {
+            binary: "claude".to_string(),
+            system_prompt: build_system_prompt(mode),
+        }
+    }
+
     pub fn with_binary(binary: impl Into<String>) -> Self {
         Self {
             binary: binary.into(),
-            system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
+            system_prompt: build_system_prompt(ReasonerMode::default()),
         }
     }
+
+    pub fn with_mode(mut self, mode: ReasonerMode) -> Self {
+        self.system_prompt = build_system_prompt(mode);
+        self
+    }
+}
+
+pub(super) fn build_system_prompt(mode: ReasonerMode) -> String {
+    format!(
+        concat!(
+            "You are the conductor for a fleet of AI coding agent sessions. ",
+            "Given an observation of the fleet, recommend actions that keep work moving. ",
+            "Reply with a single JSON object and nothing else: ",
+            "{{\"recommendations\": [{{\"session_id\": \"...\", \"action\": {{\"kind\": \"...\"}}, ",
+            "\"rationale\": \"...\", \"confidence\": 0.0}}]}}. ",
+            "`confidence` is optional (0.0 to 1.0); include it when you're less than certain. ",
+            "Valid action kinds: snooze (with minutes: integer), favorite, unfavorite, archive, ",
+            "nudge (with message: string), no_op. ",
+            "Archive is destructive and only takes effect if the user has opted in. ",
+            "{}"
+        ),
+        mode.posture_line()
+    )
 }
 
 impl Reasoner for ClaudePrintReasoner {
@@ -112,6 +125,14 @@ mod tests {
         assert_eq!(recs[0].session_id, "abc");
         assert_eq!(recs[0].action, Action::Snooze { minutes: 30 });
         assert_eq!(recs[0].rationale, "still waiting on human");
+        assert_eq!(recs[0].confidence, None);
+    }
+
+    #[test]
+    fn parses_confidence_when_present() {
+        let json = r#"{"recommendations":[{"session_id":"abc","action":{"kind":"favorite"},"rationale":"","confidence":0.85}]}"#;
+        let recs = parse_recommendations(json).unwrap();
+        assert_eq!(recs[0].confidence, Some(0.85));
     }
 
     #[test]

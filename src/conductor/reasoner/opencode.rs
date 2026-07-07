@@ -4,20 +4,9 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::{Observation, Reasoner, Recommendation};
+use super::{Observation, Reasoner, ReasonerMode, Recommendation};
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:4096";
-
-const DEFAULT_SYSTEM_PROMPT: &str = concat!(
-    "You are the conductor for a fleet of AI coding agent sessions. ",
-    "Given an observation of the fleet, recommend actions that keep work moving. ",
-    "Reply with a single JSON object and nothing else: ",
-    "{\"recommendations\": [{\"session_id\": \"...\", \"action\": {\"kind\": \"...\"}, \"rationale\": \"...\"}]}. ",
-    "Valid action kinds: snooze (with minutes: integer), favorite, unfavorite, archive, ",
-    "nudge (with message: string), no_op. ",
-    "Be conservative. Prefer no_op when nothing is clearly needed. ",
-    "Archive is destructive and only takes effect if the user has opted in."
-);
 
 /// Reasoner backed by a running `opencode serve` daemon. The user is
 /// expected to have that daemon running out of band; the conductor does
@@ -29,19 +18,28 @@ pub struct OpenCodeReasoner {
 
 impl Default for OpenCodeReasoner {
     fn default() -> Self {
-        Self {
-            endpoint: DEFAULT_ENDPOINT.to_string(),
-            system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
-        }
+        Self::for_mode(ReasonerMode::default())
     }
 }
 
 impl OpenCodeReasoner {
+    pub fn for_mode(mode: ReasonerMode) -> Self {
+        Self {
+            endpoint: DEFAULT_ENDPOINT.to_string(),
+            system_prompt: super::claude_print::build_system_prompt(mode),
+        }
+    }
+
     pub fn with_endpoint(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
-            system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
+            system_prompt: super::claude_print::build_system_prompt(ReasonerMode::default()),
         }
+    }
+
+    pub fn with_mode(mut self, mode: ReasonerMode) -> Self {
+        self.system_prompt = super::claude_print::build_system_prompt(mode);
+        self
     }
 }
 

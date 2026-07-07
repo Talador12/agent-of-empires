@@ -156,6 +156,7 @@ fn log_recommendations(recs: &[Recommendation]) {
             session_id = %r.session_id,
             action = ?r.action,
             rationale = %r.rationale,
+            confidence = ?r.confidence,
             "recommendation"
         );
     }
@@ -207,6 +208,7 @@ mod tests {
             session_id: "abc".into(),
             action: Action::Snooze { minutes: 15 },
             rationale: "quiet hours".into(),
+            confidence: Some(0.9),
         }];
         log_recommendations(&recs);
     }

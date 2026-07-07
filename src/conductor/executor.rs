@@ -211,6 +211,7 @@ mod tests {
             session_id: session_id.into(),
             action,
             rationale: "test".into(),
+            confidence: None,
         }
     }
 

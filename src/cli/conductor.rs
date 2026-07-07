@@ -17,6 +17,7 @@ use crate::conductor::intelligence::{Backoff, SessionPool};
 use crate::conductor::policies::{ConductorPolicies, QuietHours};
 use crate::conductor::reasoner::claude_print::ClaudePrintReasoner;
 use crate::conductor::reasoner::opencode::OpenCodeReasoner;
+use crate::conductor::reasoner::ReasonerMode;
 use crate::conductor::watcher::{Watcher, DEFAULT_POLL_INTERVAL};
 use crate::conductor::{self};
 use crate::session::{Instance, Storage};
@@ -75,6 +76,11 @@ pub struct ConductorWatchArgs {
     /// `--reasoner opencode` is set. Defaults to `http://127.0.0.1:4096`.
     #[arg(long)]
     pub opencode_endpoint: Option<String>,
+
+    /// Reasoner posture: how eagerly to recommend actions. Ports aoaoe's
+    /// promptTemplate.
+    #[arg(long, default_value = "balanced", value_parser = ["conservative", "balanced", "aggressive"])]
+    pub mode: String,
 
     /// Actually apply recommended actions to session state. Off by default
     /// so a first-time run is safe: recommendations are logged, not
@@ -321,14 +327,16 @@ async fn watch(profile: &str, args: ConductorWatchArgs) -> Result<()> {
         quiet_hours,
     };
 
+    let mode = ReasonerMode::from_cli(&args.mode).context("--mode")?;
+
     // Reasoner type differs per backend, so drive the watcher through a
     // generic helper rather than trying to unify the types at this call
     // site. Both arms compile to the same tick loop.
     match args.reasoner.as_str() {
         "opencode" => {
             let reasoner = match args.opencode_endpoint {
-                Some(url) => OpenCodeReasoner::with_endpoint(url),
-                None => OpenCodeReasoner::default(),
+                Some(url) => OpenCodeReasoner::with_endpoint(url).with_mode(mode),
+                None => OpenCodeReasoner::for_mode(mode),
             };
             run_watch(
                 profile,
@@ -342,8 +350,8 @@ async fn watch(profile: &str, args: ConductorWatchArgs) -> Result<()> {
         }
         _ => {
             let reasoner = match args.reasoner_binary {
-                Some(bin) => ClaudePrintReasoner::with_binary(bin),
-                None => ClaudePrintReasoner::default(),
+                Some(bin) => ClaudePrintReasoner::with_binary(bin).with_mode(mode),
+                None => ClaudePrintReasoner::for_mode(mode),
             };
             run_watch(
                 profile,
