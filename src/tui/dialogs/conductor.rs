@@ -1,6 +1,7 @@
-//! Full-screen conductor panel. Follows the `ServeView` shape: owns its
-//! own state, returns `ConductorAction` from `handle_key`, and takes over
-//! the whole screen while open. Display-only for now.
+//! Full-screen conductor panel. Ports aoaoe's slash-command interaction
+//! surface: a query line at the bottom lets the user swap between views
+//! (queue, tasks, health, help) and drive the conductor without leaving
+//! the panel.
 
 use std::time::Instant;
 
@@ -12,18 +13,25 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
+use crate::conductor::reasoner::ReasonerMode;
+use crate::conductor::tasks::{Task, TaskStatus, TaskStore};
 use crate::conductor::{attention_score, is_enabled as conductor_enabled, EXPERIMENTAL_ENV};
-use crate::session::{Instance, Storage};
+use crate::session::{Instance, Status, Storage};
 use crate::tui::styles::Theme;
 
-/// Actions returned by [`ConductorView::handle_key`], mirroring the
-/// full-page pattern of `ServeAction`.
 pub enum ConductorAction {
     Continue,
     Close,
 }
 
-/// Snapshot of one session, projected for the panel's table.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Queue,
+    Tasks,
+    Health,
+    Help,
+}
+
 #[derive(Clone)]
 struct RankedRow {
     title: String,
@@ -33,9 +41,29 @@ struct RankedRow {
     unread: bool,
 }
 
+#[derive(Default)]
+struct FleetHealth {
+    total: usize,
+    waiting: usize,
+    running: usize,
+    idle: usize,
+    error: usize,
+    stopped: usize,
+    favorites: usize,
+    unread: usize,
+    top_scores: Vec<i64>,
+}
+
 pub struct ConductorView {
     profile: String,
+    view: ViewMode,
+    mode: ReasonerMode,
     ranked: Vec<RankedRow>,
+    tasks: Vec<Task>,
+    health: FleetHealth,
+    input_open: bool,
+    input_buffer: String,
+    status_line: Option<String>,
     last_refreshed: Option<Instant>,
     last_refresh_error: Option<String>,
 }
@@ -44,7 +72,14 @@ impl ConductorView {
     pub fn new(profile: impl Into<String>) -> Self {
         let mut view = Self {
             profile: profile.into(),
+            view: ViewMode::Queue,
+            mode: ReasonerMode::default(),
             ranked: Vec::new(),
+            tasks: Vec::new(),
+            health: FleetHealth::default(),
+            input_open: false,
+            input_buffer: String::new(),
+            status_line: None,
             last_refreshed: None,
             last_refresh_error: None,
         };
@@ -53,21 +88,111 @@ impl ConductorView {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ConductorAction {
+        if self.input_open {
+            return self.handle_input_key(key);
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => ConductorAction::Close,
             KeyCode::Char('r') | KeyCode::F(5) => {
                 self.refresh_now();
                 ConductorAction::Continue
             }
+            // `:` and `/` both enter input mode so the user can pick the
+            // habit they already know from `vim` / `less`.
+            KeyCode::Char(':') | KeyCode::Char('/') => {
+                self.input_open = true;
+                self.input_buffer.clear();
+                self.status_line = None;
+                ConductorAction::Continue
+            }
             _ => ConductorAction::Continue,
+        }
+    }
+
+    fn handle_input_key(&mut self, key: KeyEvent) -> ConductorAction {
+        match key.code {
+            KeyCode::Esc => {
+                self.input_open = false;
+                self.input_buffer.clear();
+                ConductorAction::Continue
+            }
+            KeyCode::Enter => {
+                let cmd = std::mem::take(&mut self.input_buffer);
+                self.input_open = false;
+                self.execute(cmd.trim())
+            }
+            KeyCode::Backspace => {
+                self.input_buffer.pop();
+                ConductorAction::Continue
+            }
+            KeyCode::Char(c) => {
+                self.input_buffer.push(c);
+                ConductorAction::Continue
+            }
+            _ => ConductorAction::Continue,
+        }
+    }
+
+    fn execute(&mut self, cmd: &str) -> ConductorAction {
+        let cmd = cmd.trim_start_matches([':', '/']);
+        let mut parts = cmd.split_whitespace();
+        let head = parts.next().unwrap_or("");
+        let tail: Vec<&str> = parts.collect();
+
+        match head {
+            "" => ConductorAction::Continue,
+            "q" | "quit" | "exit" => ConductorAction::Close,
+            "h" | "help" => {
+                self.view = ViewMode::Help;
+                self.status_line = Some("help view".into());
+                ConductorAction::Continue
+            }
+            "r" | "refresh" => {
+                self.refresh_now();
+                ConductorAction::Continue
+            }
+            "queue" | "sessions" => {
+                self.view = ViewMode::Queue;
+                self.refresh_now();
+                ConductorAction::Continue
+            }
+            "tasks" => {
+                self.view = ViewMode::Tasks;
+                self.refresh_now();
+                ConductorAction::Continue
+            }
+            "health" => {
+                self.view = ViewMode::Health;
+                self.refresh_now();
+                ConductorAction::Continue
+            }
+            "mode" => {
+                let Some(arg) = tail.first() else {
+                    self.status_line = Some("usage: :mode conservative|balanced|aggressive".into());
+                    return ConductorAction::Continue;
+                };
+                match ReasonerMode::from_cli(arg) {
+                    Ok(mode) => {
+                        self.mode = mode;
+                        self.status_line = Some(format!("mode = {:?}", self.mode));
+                    }
+                    Err(e) => self.status_line = Some(format!("bad mode: {e}")),
+                }
+                ConductorAction::Continue
+            }
+            other => {
+                self.status_line = Some(format!("unknown command: {other} (try :help)"));
+                ConductorAction::Continue
+            }
         }
     }
 
     fn refresh_now(&mut self) {
         self.last_refreshed = Some(Instant::now());
         match load_ranked(&self.profile) {
-            Ok(rows) => {
+            Ok((rows, health)) => {
                 self.ranked = rows;
+                self.health = health;
                 self.last_refresh_error = None;
             }
             Err(err) => {
@@ -75,19 +200,33 @@ impl ConductorView {
                 self.ranked.clear();
             }
         }
+        // Best-effort load; a bad task file is not fatal for the panel.
+        self.tasks = TaskStore::for_profile(&self.profile)
+            .and_then(|s| s.load())
+            .unwrap_or_default();
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let footer_lines = if self.input_open || self.status_line.is_some() {
+            2
+        } else {
+            1
+        };
         let vertical = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(1),
-                Constraint::Length(1),
+                Constraint::Length(footer_lines),
             ])
             .split(area);
         self.render_header(frame, vertical[0], theme);
-        self.render_body(frame, vertical[1], theme);
+        match self.view {
+            ViewMode::Queue => self.render_queue(frame, vertical[1], theme),
+            ViewMode::Tasks => self.render_tasks(frame, vertical[1], theme),
+            ViewMode::Health => self.render_health(frame, vertical[1], theme),
+            ViewMode::Help => self.render_help(frame, vertical[1], theme),
+        }
         self.render_footer(frame, vertical[2], theme);
     }
 
@@ -99,10 +238,18 @@ impl ConductorView {
         } else {
             Span::styled("disabled", Style::default().fg(theme.dimmed).bold())
         };
+        let view_label = match self.view {
+            ViewMode::Queue => "queue",
+            ViewMode::Tasks => "tasks",
+            ViewMode::Health => "health",
+            ViewMode::Help => "help",
+        };
         let header = vec![
             Line::from(vec![
                 Span::styled("Conductor", title_style),
                 Span::raw("  (experimental)"),
+                Span::raw("    view: "),
+                Span::styled(view_label, accent_style),
             ]),
             Line::from(vec![
                 Span::raw("profile: "),
@@ -110,22 +257,15 @@ impl ConductorView {
                 Span::raw("    "),
                 Span::raw(format!("{}=", EXPERIMENTAL_ENV)),
                 gate,
+                Span::raw("    mode: "),
+                Span::styled(format!("{:?}", self.mode), accent_style),
             ]),
         ];
         let block = Block::default().borders(Borders::BOTTOM);
         frame.render_widget(Paragraph::new(header).block(block), area);
     }
 
-    fn render_body(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-            .split(area);
-        self.render_ranked_table(frame, cols[0], theme);
-        self.render_help_pane(frame, cols[1], theme);
-    }
-
-    fn render_ranked_table(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn render_queue(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" Attention queue ");
@@ -147,7 +287,6 @@ impl ConductorView {
             );
             return;
         }
-
         let header = Row::new(vec![
             Cell::from("SCORE"),
             Cell::from("STATUS"),
@@ -155,7 +294,6 @@ impl ConductorView {
             Cell::from("FLAGS"),
         ])
         .style(Style::default().fg(theme.title).bold());
-
         let rows: Vec<Row> = self
             .ranked
             .iter()
@@ -175,7 +313,6 @@ impl ConductorView {
                 ])
             })
             .collect();
-
         let widths = [
             Constraint::Length(6),
             Constraint::Length(10),
@@ -186,46 +323,165 @@ impl ConductorView {
         frame.render_widget(table, area);
     }
 
-    fn render_help_pane(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn render_tasks(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let block = Block::default().borders(Borders::ALL).title(" Tasks ");
+        if self.tasks.is_empty() {
+            frame.render_widget(
+                Paragraph::new("No tasks. Add one with `aoe conductor task add`.")
+                    .block(block)
+                    .alignment(Alignment::Center),
+                area,
+            );
+            return;
+        }
+        let header = Row::new(vec![
+            Cell::from("ID"),
+            Cell::from("STATUS"),
+            Cell::from("SESSION"),
+            Cell::from("TITLE"),
+        ])
+        .style(Style::default().fg(theme.title).bold());
+        let rows: Vec<Row> = self
+            .tasks
+            .iter()
+            .map(|t| {
+                let status = match t.status {
+                    TaskStatus::Pending => "pending",
+                    TaskStatus::InProgress => "in_progress",
+                    TaskStatus::Completed => "completed",
+                };
+                let session = t.linked_session_id.as_deref().unwrap_or("-").to_string();
+                Row::new(vec![
+                    Cell::from(t.id.clone()),
+                    Cell::from(status),
+                    Cell::from(session),
+                    Cell::from(t.title.clone()),
+                ])
+            })
+            .collect();
+        let widths = [
+            Constraint::Length(20),
+            Constraint::Length(12),
+            Constraint::Length(10),
+            Constraint::Min(10),
+        ];
+        let table = Table::new(rows, widths).header(header).block(block);
+        frame.render_widget(table, area);
+    }
+
+    fn render_health(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let title_style = Style::default().fg(theme.title).bold();
+        let accent_style = Style::default().fg(theme.accent);
+        let h = &self.health;
+        let top = if h.top_scores.is_empty() {
+            "(none)".to_string()
+        } else {
+            h.top_scores
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let lines = vec![
+            Line::from(Span::styled("Fleet health", title_style)),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("Total     "),
+                Span::styled(h.total.to_string(), accent_style),
+            ]),
+            Line::from(vec![
+                Span::raw("Waiting   "),
+                Span::styled(h.waiting.to_string(), accent_style),
+            ]),
+            Line::from(vec![
+                Span::raw("Running   "),
+                Span::styled(h.running.to_string(), accent_style),
+            ]),
+            Line::from(vec![
+                Span::raw("Idle      "),
+                Span::styled(h.idle.to_string(), accent_style),
+            ]),
+            Line::from(vec![
+                Span::raw("Error     "),
+                Span::styled(h.error.to_string(), accent_style),
+            ]),
+            Line::from(vec![
+                Span::raw("Stopped   "),
+                Span::styled(h.stopped.to_string(), accent_style),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("Favorites "),
+                Span::styled(h.favorites.to_string(), accent_style),
+            ]),
+            Line::from(vec![
+                Span::raw("Unread    "),
+                Span::styled(h.unread.to_string(), accent_style),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("Top scores  "),
+                Span::styled(top, accent_style),
+            ]),
+        ];
+        let block = Block::default().borders(Borders::ALL).title(" Health ");
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    fn render_help(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let title_style = Style::default().fg(theme.title).bold();
         let cmd_style = Style::default().fg(theme.accent);
-        let hint = vec![
-            Line::from(Span::styled("What the conductor does", title_style)),
+        let lines = vec![
+            Line::from(Span::styled("Slash commands", title_style)),
             Line::from(""),
-            Line::from("Ranks every active session by an attention score"),
-            Line::from("derived from status, unread, favorite, and staleness."),
-            Line::from("Archived, trashed, and actively snoozed sessions are"),
-            Line::from("excluded from the queue."),
+            Line::from(vec![
+                Span::styled(":queue", cmd_style),
+                Span::raw("      switch to the ranked queue"),
+            ]),
+            Line::from(vec![
+                Span::styled(":tasks", cmd_style),
+                Span::raw("      switch to the task list"),
+            ]),
+            Line::from(vec![
+                Span::styled(":health", cmd_style),
+                Span::raw("     switch to the fleet-health strip"),
+            ]),
+            Line::from(vec![
+                Span::styled(":refresh", cmd_style),
+                Span::raw("    reload from disk"),
+            ]),
+            Line::from(vec![
+                Span::styled(":mode <m>", cmd_style),
+                Span::raw("   set reasoner posture: conservative|balanced|aggressive"),
+            ]),
+            Line::from(vec![
+                Span::styled(":help", cmd_style),
+                Span::raw("       this screen"),
+            ]),
+            Line::from(vec![
+                Span::styled(":quit", cmd_style),
+                Span::raw("       close the panel"),
+            ]),
             Line::from(""),
-            Line::from(Span::styled("From the CLI", title_style)),
+            Line::from(Span::styled("Keys (normal mode)", title_style)),
             Line::from(vec![
-                Span::styled("  aoe conductor status", cmd_style),
-                Span::raw("  (this same table)"),
+                Span::styled("  r / F5", cmd_style),
+                Span::raw("     refresh"),
             ]),
             Line::from(vec![
-                Span::styled("  aoe conductor watch --once", cmd_style),
-                Span::raw("  (one reasoner tick)"),
+                Span::styled("  : or /", cmd_style),
+                Span::raw("     open the command line"),
             ]),
             Line::from(vec![
-                Span::styled("  aoe conductor watch --live", cmd_style),
-                Span::raw("  (loop + apply)"),
+                Span::styled("  Esc / q", cmd_style),
+                Span::raw("    close"),
             ]),
-            Line::from(vec![Span::styled(
-                "  aoe conductor spawn --repo o/r",
-                cmd_style,
-            )]),
-            Line::from(vec![
-                Span::raw("      "),
-                Span::raw("(one session / issue)"),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled("This panel", title_style)),
-            Line::from("Display-only in this release. Interactive tick"),
-            Line::from("and apply land in a follow-up. See issue #553."),
         ];
-        let block = Block::default().borders(Borders::ALL).title(" How to use ");
+        let block = Block::default().borders(Borders::ALL).title(" Help ");
         frame.render_widget(
-            Paragraph::new(hint).block(block).wrap(Wrap { trim: false }),
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false }),
             area,
         );
     }
@@ -236,32 +492,49 @@ impl ConductorView {
             .last_refreshed
             .map(|t| format!("refreshed {}s ago", t.elapsed().as_secs()))
             .unwrap_or_else(|| "not yet refreshed".to_string());
-        let footer = Line::from(vec![
+
+        let mut lines: Vec<Line> = Vec::new();
+        if self.input_open {
+            lines.push(Line::from(vec![
+                Span::styled(":", key_style),
+                Span::raw(self.input_buffer.clone()),
+                Span::styled("_", Style::default().fg(theme.accent)),
+            ]));
+        } else if let Some(status) = &self.status_line {
+            lines.push(Line::from(Span::styled(
+                status.clone(),
+                Style::default().fg(theme.hint),
+            )));
+        }
+        lines.push(Line::from(vec![
             Span::styled("Esc/q ", key_style),
             Span::raw("close    "),
             Span::styled("r ", key_style),
-            Span::raw("refresh now    "),
+            Span::raw("refresh    "),
+            Span::styled(": ", key_style),
+            Span::raw("command    "),
             Span::raw(refreshed),
             Span::raw("    "),
             Span::raw(format!("at {}", Utc::now().format("%H:%M:%S"))),
-        ]);
-        frame.render_widget(Paragraph::new(footer), area);
+        ]));
+        frame.render_widget(Paragraph::new(lines), area);
     }
 }
 
-fn load_ranked(profile: &str) -> anyhow::Result<Vec<RankedRow>> {
+fn load_ranked(profile: &str) -> anyhow::Result<(Vec<RankedRow>, FleetHealth)> {
     let storage = Storage::new_unwatched(profile)?;
     let (mut instances, _) = storage.load_with_groups()?;
     crate::tmux::refresh_session_cache();
     for inst in &mut instances {
         inst.update_status();
     }
+    let health = compute_health(&instances);
     let mut scored: Vec<(i64, Instance)> = instances
         .into_iter()
         .filter_map(|i| attention_score(&i).map(|s| (s, i)))
         .collect();
     scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
-    Ok(scored
+    let rows = scored
         .into_iter()
         .map(|(score, inst)| RankedRow {
             title: inst.title,
@@ -270,7 +543,37 @@ fn load_ranked(profile: &str) -> anyhow::Result<Vec<RankedRow>> {
             favorited: inst.favorited_at.is_some(),
             unread: inst.unread,
         })
-        .collect())
+        .collect();
+    Ok((rows, health))
+}
+
+fn compute_health(instances: &[Instance]) -> FleetHealth {
+    let mut h = FleetHealth {
+        total: instances.len(),
+        ..FleetHealth::default()
+    };
+    for inst in instances {
+        match inst.status {
+            Status::Waiting => h.waiting += 1,
+            Status::Running => h.running += 1,
+            Status::Idle | Status::Unknown => h.idle += 1,
+            Status::Error => h.error += 1,
+            Status::Stopped => h.stopped += 1,
+            _ => {}
+        }
+        if inst.favorited_at.is_some() {
+            h.favorites += 1;
+        }
+        if inst.unread {
+            h.unread += 1;
+        }
+        if let Some(s) = attention_score(inst) {
+            h.top_scores.push(s);
+        }
+    }
+    h.top_scores.sort_by(|a, b| b.cmp(a));
+    h.top_scores.truncate(3);
+    h
 }
 
 #[cfg(test)]
@@ -278,34 +581,73 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyModifiers};
 
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
     #[test]
-    fn esc_closes() {
+    fn esc_closes_from_normal_mode() {
         let mut v = ConductorView::new("test-profile");
-        let action = v.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let action = v.handle_key(key(KeyCode::Esc));
         assert!(matches!(action, ConductorAction::Close));
     }
 
     #[test]
-    fn q_closes() {
+    fn colon_opens_input_mode() {
         let mut v = ConductorView::new("test-profile");
-        let action = v.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        v.handle_key(key(KeyCode::Char(':')));
+        assert!(v.input_open);
+    }
+
+    #[test]
+    fn esc_from_input_returns_to_normal() {
+        let mut v = ConductorView::new("test-profile");
+        v.handle_key(key(KeyCode::Char(':')));
+        v.handle_key(key(KeyCode::Esc));
+        assert!(!v.input_open);
+    }
+
+    #[test]
+    fn typing_command_and_enter_switches_view() {
+        let mut v = ConductorView::new("test-profile");
+        v.handle_key(key(KeyCode::Char(':')));
+        for c in "tasks".chars() {
+            v.handle_key(key(KeyCode::Char(c)));
+        }
+        v.handle_key(key(KeyCode::Enter));
+        assert!(matches!(v.view, ViewMode::Tasks));
+    }
+
+    #[test]
+    fn quit_command_closes_panel() {
+        let mut v = ConductorView::new("test-profile");
+        v.handle_key(key(KeyCode::Char(':')));
+        for c in "quit".chars() {
+            v.handle_key(key(KeyCode::Char(c)));
+        }
+        let action = v.handle_key(key(KeyCode::Enter));
         assert!(matches!(action, ConductorAction::Close));
     }
 
     #[test]
-    fn r_refreshes_and_continues() {
+    fn mode_command_changes_reasoner_mode() {
         let mut v = ConductorView::new("test-profile");
-        let before = v.last_refreshed;
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let action = v.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-        assert!(matches!(action, ConductorAction::Continue));
-        assert!(v.last_refreshed > before);
+        v.handle_key(key(KeyCode::Char(':')));
+        for c in "mode aggressive".chars() {
+            v.handle_key(key(KeyCode::Char(c)));
+        }
+        v.handle_key(key(KeyCode::Enter));
+        assert_eq!(v.mode, ReasonerMode::Aggressive);
     }
 
     #[test]
-    fn other_keys_continue() {
+    fn unknown_command_sets_status_line() {
         let mut v = ConductorView::new("test-profile");
-        let action = v.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-        assert!(matches!(action, ConductorAction::Continue));
+        v.handle_key(key(KeyCode::Char(':')));
+        for c in "unknown".chars() {
+            v.handle_key(key(KeyCode::Char(c)));
+        }
+        v.handle_key(key(KeyCode::Enter));
+        assert!(v.status_line.as_deref().unwrap_or("").contains("unknown"));
     }
 }
