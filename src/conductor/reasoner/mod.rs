@@ -102,9 +102,7 @@ pub struct Recommendation {
     pub confidence: Option<f64>,
 }
 
-/// The set of actions the reasoner is allowed to suggest. Deliberately
-/// small so the LLM has a closed vocabulary. Widened as each executor
-/// path lands.
+/// Closed set of actions the reasoner may suggest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Action {
@@ -114,14 +112,18 @@ pub enum Action {
     Favorite,
     /// Remove the favorite pin.
     Unfavorite,
-    /// Move the session out of the active view. Sinks to the archived
-    /// bucket, hidden from every non-archived surface. Gated by
+    /// Move the session out of the active view. Gated by
     /// `ConductorPolicies::allow_destructive`.
     Archive,
-    /// Send a nudge message to the session's agent. Executor support lands
-    /// with the send-input policy in a later commit; the reasoner is
-    /// allowed to suggest it now so the JSON vocabulary is stable.
+    /// Send a text message to the session's running agent via
+    /// `tmux send-keys`. Gated by `ConductorPolicies::allow_nudge`.
     Nudge { message: String },
+    /// Bring a stopped or dead session back up. Runs the same startup path
+    /// as `aoe session start`.
+    StartSession,
+    /// Stop the session's tmux pane (and its container if sandboxed).
+    /// Gated by `ConductorPolicies::allow_destructive`.
+    StopSession,
     /// Explicitly recommend doing nothing this tick.
     NoOp,
 }

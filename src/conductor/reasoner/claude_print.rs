@@ -50,8 +50,9 @@ pub(super) fn build_system_prompt(mode: ReasonerMode) -> String {
             "\"rationale\": \"...\", \"confidence\": 0.0}}]}}. ",
             "`confidence` is optional (0.0 to 1.0); include it when you're less than certain. ",
             "Valid action kinds: snooze (with minutes: integer), favorite, unfavorite, archive, ",
-            "nudge (with message: string), no_op. ",
-            "Archive is destructive and only takes effect if the user has opted in. ",
+            "nudge (with message: string), start_session, stop_session, no_op. ",
+            "Archive and stop_session are destructive; nudge is disruptive. ",
+            "Each only takes effect if the user has opted in via the matching policy. ",
             "{}"
         ),
         mode.posture_line()
@@ -145,10 +146,12 @@ mod tests {
             {"session_id":"c","action":{"kind":"unfavorite"},"rationale":""},
             {"session_id":"d","action":{"kind":"archive"},"rationale":""},
             {"session_id":"e","action":{"kind":"nudge","message":"still there?"},"rationale":""},
-            {"session_id":"f","action":{"kind":"no_op"},"rationale":""}
+            {"session_id":"f","action":{"kind":"start_session"},"rationale":""},
+            {"session_id":"g","action":{"kind":"stop_session"},"rationale":""},
+            {"session_id":"h","action":{"kind":"no_op"},"rationale":""}
         ]}"#;
         let recs = parse_recommendations(json).unwrap();
-        assert_eq!(recs.len(), 6);
+        assert_eq!(recs.len(), 8);
         assert_eq!(recs[0].action, Action::Snooze { minutes: 10 });
         assert_eq!(recs[1].action, Action::Favorite);
         assert_eq!(recs[2].action, Action::Unfavorite);
@@ -159,7 +162,9 @@ mod tests {
                 message: "still there?".into()
             }
         );
-        assert_eq!(recs[5].action, Action::NoOp);
+        assert_eq!(recs[5].action, Action::StartSession);
+        assert_eq!(recs[6].action, Action::StopSession);
+        assert_eq!(recs[7].action, Action::NoOp);
     }
 
     #[test]

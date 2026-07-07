@@ -146,59 +146,73 @@ fn apply_one(
     match &rec.action {
         Action::Snooze { minutes } => {
             inst.snooze(*minutes);
-            Outcome::Applied {
-                session_id: rec.session_id.clone(),
-                action: rec.action.clone(),
-            }
+            applied(rec)
         }
         Action::Favorite => {
             inst.favorite();
-            Outcome::Applied {
-                session_id: rec.session_id.clone(),
-                action: rec.action.clone(),
-            }
+            applied(rec)
         }
         Action::Unfavorite => {
             inst.unfavorite();
-            Outcome::Applied {
-                session_id: rec.session_id.clone(),
-                action: rec.action.clone(),
-            }
+            applied(rec)
         }
         Action::Archive => {
             if !policies.allow_destructive {
-                Outcome::Blocked {
-                    session_id: rec.session_id.clone(),
-                    action: rec.action.clone(),
-                    reason: "policies.allow_destructive is off".into(),
-                }
+                blocked(rec, "policies.allow_destructive is off")
             } else {
                 inst.archive();
-                Outcome::Applied {
-                    session_id: rec.session_id.clone(),
-                    action: rec.action.clone(),
+                applied(rec)
+            }
+        }
+        Action::Nudge { message } => {
+            if !policies.allow_nudge {
+                blocked(rec, "policies.allow_nudge is off")
+            } else {
+                match send_nudge(inst, message) {
+                    Ok(()) => applied(rec),
+                    Err(err) => blocked(rec, &format!("send-keys failed: {err}")),
                 }
             }
         }
-        Action::Nudge { .. } => {
-            if !policies.allow_nudge {
-                Outcome::Blocked {
-                    session_id: rec.session_id.clone(),
-                    action: rec.action.clone(),
-                    reason: "policies.allow_nudge is off".into(),
-                }
+        Action::StartSession => match inst.start() {
+            Ok(()) => applied(rec),
+            Err(err) => blocked(rec, &format!("start failed: {err}")),
+        },
+        Action::StopSession => {
+            if !policies.allow_destructive {
+                blocked(rec, "policies.allow_destructive is off")
             } else {
-                // Send-input plumbing lands in a follow-up commit; until
-                // then, an opted-in user still gets a clear log entry.
-                Outcome::Blocked {
-                    session_id: rec.session_id.clone(),
-                    action: rec.action.clone(),
-                    reason: "nudge dispatch not yet implemented".into(),
+                match inst.stop() {
+                    Ok(()) => applied(rec),
+                    Err(err) => blocked(rec, &format!("stop failed: {err}")),
                 }
             }
         }
         Action::NoOp => unreachable!("NoOp handled above"),
     }
+}
+
+fn applied(rec: &Recommendation) -> Outcome {
+    Outcome::Applied {
+        session_id: rec.session_id.clone(),
+        action: rec.action.clone(),
+    }
+}
+
+fn blocked(rec: &Recommendation, reason: &str) -> Outcome {
+    Outcome::Blocked {
+        session_id: rec.session_id.clone(),
+        action: rec.action.clone(),
+        reason: reason.to_string(),
+    }
+}
+
+/// Deliver a nudge message to the session's tmux pane, mirroring the
+/// aoaoe `send_input` executor action. Uses the shared
+/// `TmuxSession::send_keys` helper so behavior matches `aoe session send`.
+fn send_nudge(inst: &crate::session::Instance, message: &str) -> anyhow::Result<()> {
+    let session = crate::tmux::Session::new(&inst.id, &inst.title)?;
+    session.send_keys(message)
 }
 
 #[cfg(test)]
@@ -346,26 +360,19 @@ mod tests {
     }
 
     #[test]
-    fn nudge_blocked_when_opted_in_pending_impl() {
+    fn stop_session_blocked_when_policy_off() {
         let mut fleet = vec![inst("a")];
-        let mut policies = ConductorPolicies::default();
-        policies.allow_nudge = true;
         let out = apply_one(
             &mut fleet,
-            &rec(
-                "a",
-                Action::Nudge {
-                    message: "hi".into(),
-                },
-            ),
-            &policies,
+            &rec("a", Action::StopSession),
+            &ConductorPolicies::default(),
             &empty_cooldown(),
         );
         match out {
             Outcome::Blocked { reason, .. } => {
-                assert!(reason.contains("not yet implemented"));
+                assert!(reason.contains("allow_destructive"));
             }
-            _ => panic!("expected Blocked pending implementation"),
+            _ => panic!("expected Blocked"),
         }
     }
 
