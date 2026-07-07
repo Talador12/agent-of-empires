@@ -294,9 +294,22 @@ Three read paths (CLI, TUI panel, `GET /api/conductor/state`) share one attentio
 
 ### Follow-ups (not in this first PR)
 
-- Interactive tick + apply from the TUI panel (currently palette-open, display-only).
-- Mirror into `src/tui/remote_home/` so the panel is visible when the TUI attaches to a remote daemon.
-- Server-sent-events stream on the web endpoint, so the dashboard can render fresh recommendations without polling.
-- Port the intelligence modules that need session output content (health scoring, error-pattern detection, idle escalation curves): the observation-building path needs a pane-content input first.
-- `AOE_EXPERIMENTAL_AO_MODE` promotion to a config flag once the surface stabilizes.
+- SSE stream on `/api/conductor/events`. The five `/api/conductor/*` endpoints
+  ship in this PR, but a broadcast channel from the watcher into the server
+  process is a lifecycle-plumbing change outside the scope of a REST expansion.
+- Live tick + apply from the TUI panel. The panel now supports slash-command
+  view switching, tasks/health/help views, and mode selection; wiring an async
+  reasoner call through the app-level event loop with a shared `Arc<Mutex<>>`
+  state channel is the next step.
+- LLM-driven `CreateAgent` / `RemoveAgent` actions. The LLM would need to
+  specify every `aoe add` argument correctly, which is fragile. Users spawn
+  sessions through `aoe conductor spawn --repo owner/repo` instead.
+- Remaining 20+ aoaoe intelligence modules (cost attribution, goal cascading,
+  approval workflows, fleet forecasting, alert rules). Most need durable
+  metrics history the observation pipeline does not yet accumulate.
+- Full ratatui rewrite of the chat surface. `aoe conductor chat` ships as a
+  plain-terminal REPL for now; the full TUI chat aoaoe has in `chat.ts` is a
+  standalone binary and is called out for follow-up.
+- `AOE_EXPERIMENTAL_AO_MODE` promotion to a config flag once the surface
+  stabilizes.
 
