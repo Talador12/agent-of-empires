@@ -18,6 +18,7 @@ use crate::conductor::policies::{ConductorPolicies, QuietHours};
 use crate::conductor::reasoner::claude_print::ClaudePrintReasoner;
 use crate::conductor::reasoner::opencode::OpenCodeReasoner;
 use crate::conductor::reasoner::ReasonerMode;
+use crate::conductor::tasks::{Task, TaskStore};
 use crate::conductor::watcher::{Watcher, DEFAULT_POLL_INTERVAL};
 use crate::conductor::{self};
 use crate::session::{Instance, Storage};
@@ -36,6 +37,79 @@ pub enum ConductorCommands {
     /// user's existing auth applies. Dry-runs by default; pass `--live`
     /// to actually create sessions.
     Spawn(ConductorSpawnArgs),
+
+    /// Manage the conductor's task list. Tasks give the reasoner
+    /// long-lived goals to reason about across sessions.
+    Task {
+        #[command(subcommand)]
+        command: TaskCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TaskCommands {
+    /// List every task in the profile's task store.
+    List(TaskListArgs),
+    /// Add a task.
+    Add(TaskAddArgs),
+    /// Remove a task by id.
+    Remove(TaskRemoveArgs),
+    /// Link a task to a session (marks the task in-progress).
+    Link(TaskLinkArgs),
+    /// Append a progress note to a task.
+    Progress(TaskProgressArgs),
+    /// Mark a task complete.
+    Complete(TaskCompleteArgs),
+}
+
+#[derive(Args)]
+pub struct TaskListArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct TaskAddArgs {
+    /// Short id used as the task's stable handle (e.g. `ship-conductor`).
+    #[arg(long)]
+    pub id: String,
+    #[arg(long)]
+    pub title: String,
+    /// One-sentence description of the outcome the reasoner should watch for.
+    #[arg(long)]
+    pub goal: String,
+    /// Optional keyword each observation is filtered against for drift
+    /// detection. Repeat the flag to add multiple.
+    #[arg(long)]
+    pub keyword: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct TaskRemoveArgs {
+    #[arg(long)]
+    pub id: String,
+}
+
+#[derive(Args)]
+pub struct TaskLinkArgs {
+    #[arg(long)]
+    pub id: String,
+    #[arg(long)]
+    pub session_id: String,
+}
+
+#[derive(Args)]
+pub struct TaskProgressArgs {
+    #[arg(long)]
+    pub id: String,
+    #[arg(long)]
+    pub note: String,
+}
+
+#[derive(Args)]
+pub struct TaskCompleteArgs {
+    #[arg(long)]
+    pub id: String,
 }
 
 #[derive(Args)]
@@ -172,7 +246,67 @@ pub async fn run(profile: &str, command: ConductorCommands) -> Result<()> {
         ConductorCommands::Status(args) => status(profile, args).await,
         ConductorCommands::Watch(args) => watch(profile, args).await,
         ConductorCommands::Spawn(args) => spawn(profile, args).await,
+        ConductorCommands::Task { command } => task(profile, command).await,
     }
+}
+
+async fn task(profile: &str, command: TaskCommands) -> Result<()> {
+    let store = TaskStore::for_profile(profile)?;
+    match command {
+        TaskCommands::List(args) => {
+            let tasks = store.load()?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&tasks)?);
+                return Ok(());
+            }
+            if tasks.is_empty() {
+                println!("No tasks in profile '{profile}'.");
+                return Ok(());
+            }
+            println!("{:<20}  {:<12}  {:<10}  TITLE", "ID", "STATUS", "SESSION");
+            for t in &tasks {
+                let status = format!("{:?}", t.status);
+                let session = t.linked_session_id.as_deref().unwrap_or("-");
+                let title = super::truncate(&t.title, 40);
+                println!("{:<20}  {:<12}  {:<10}  {}", t.id, status, session, title);
+            }
+        }
+        TaskCommands::Add(args) => {
+            let mut task = Task::new(args.id.clone(), args.title, args.goal);
+            task.keywords = args.keyword;
+            store.add(task)?;
+            println!("added task {}", args.id);
+        }
+        TaskCommands::Remove(args) => {
+            if store.remove(&args.id)? {
+                println!("removed task {}", args.id);
+            } else {
+                anyhow::bail!("no such task: {}", args.id);
+            }
+        }
+        TaskCommands::Link(args) => {
+            if store.link_session(&args.id, &args.session_id)? {
+                println!("linked task {} to session {}", args.id, args.session_id);
+            } else {
+                anyhow::bail!("no such task: {}", args.id);
+            }
+        }
+        TaskCommands::Progress(args) => {
+            if store.append_progress(&args.id, &args.note)? {
+                println!("recorded progress on task {}", args.id);
+            } else {
+                anyhow::bail!("no such task: {}", args.id);
+            }
+        }
+        TaskCommands::Complete(args) => {
+            if store.complete(&args.id)? {
+                println!("completed task {}", args.id);
+            } else {
+                anyhow::bail!("no such task: {}", args.id);
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn spawn(profile: &str, args: ConductorSpawnArgs) -> Result<()> {

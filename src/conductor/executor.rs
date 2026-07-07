@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use super::policies::ConductorPolicies;
 use super::reasoner::{Action, Recommendation};
+use super::tasks::TaskStore;
 use crate::session::Storage;
 
 pub struct Executor {
@@ -62,19 +63,25 @@ impl Executor {
         }
     }
 
-    /// Apply every recommendation in one `Storage::update` call so the
-    /// whole batch is durable together. Errors from the storage layer
-    /// (permissions, disk full) bubble; per-recommendation issues become
-    /// `Outcome` values in the returned list.
+    /// Apply every recommendation. Session-scoped actions are batched
+    /// through one `Storage::update` call so the whole batch is durable
+    /// together; task-scoped actions (`ReportProgress`, `CompleteTask`)
+    /// go through the `TaskStore` afterwards since they touch a different
+    /// on-disk file.
     pub fn dispatch(&self, recs: &[Recommendation]) -> Result<Vec<Outcome>> {
         if recs.is_empty() {
             return Ok(vec![]);
         }
 
-        let storage = Storage::new_unwatched(&self.profile)?;
-        let recs_owned: Vec<Recommendation> = recs.to_vec();
-        let policies = self.policies.clone();
+        let (session_recs, task_recs): (Vec<&Recommendation>, Vec<&Recommendation>) =
+            recs.iter().partition(|r| {
+                !matches!(
+                    &r.action,
+                    Action::ReportProgress { .. } | Action::CompleteTask { .. }
+                )
+            });
 
+        let policies = self.policies.clone();
         // Snapshot the cooldown map so decisions inside the storage
         // closure are consistent, then commit the fresh timestamps after
         // the write succeeds. This keeps the closure free of the
@@ -85,13 +92,24 @@ impl Executor {
             .map(|g| g.clone())
             .unwrap_or_default();
 
-        let outcomes = storage.update(|instances, _groups| {
-            let mut outcomes = Vec::with_capacity(recs_owned.len());
-            for rec in &recs_owned {
+        let session_recs_owned: Vec<Recommendation> =
+            session_recs.iter().map(|r| (*r).clone()).collect();
+        let storage = Storage::new_unwatched(&self.profile)?;
+        let mut outcomes = storage.update(|instances, _groups| {
+            let mut outcomes = Vec::with_capacity(session_recs_owned.len());
+            for rec in &session_recs_owned {
                 outcomes.push(apply_one(instances, rec, &policies, &cooldown_snapshot));
             }
             Ok(outcomes)
         })?;
+
+        // Task-scoped actions.
+        if !task_recs.is_empty() {
+            let store = TaskStore::for_profile(&self.profile)?;
+            for rec in task_recs {
+                outcomes.push(dispatch_task_action(&store, rec));
+            }
+        }
 
         // Only bump the cooldown map for outcomes that actually mutated
         // state. Blocked / NoOp / UnknownSession do not count against
@@ -106,6 +124,38 @@ impl Executor {
         }
 
         Ok(outcomes)
+    }
+}
+
+fn dispatch_task_action(store: &TaskStore, rec: &Recommendation) -> Outcome {
+    match &rec.action {
+        Action::ReportProgress { task_id, note } => match store.append_progress(task_id, note) {
+            Ok(true) => applied(rec),
+            Ok(false) => Outcome::Blocked {
+                session_id: rec.session_id.clone(),
+                action: rec.action.clone(),
+                reason: format!("unknown task_id {task_id:?}"),
+            },
+            Err(err) => Outcome::Blocked {
+                session_id: rec.session_id.clone(),
+                action: rec.action.clone(),
+                reason: format!("task store write failed: {err}"),
+            },
+        },
+        Action::CompleteTask { task_id } => match store.complete(task_id) {
+            Ok(true) => applied(rec),
+            Ok(false) => Outcome::Blocked {
+                session_id: rec.session_id.clone(),
+                action: rec.action.clone(),
+                reason: format!("unknown task_id {task_id:?}"),
+            },
+            Err(err) => Outcome::Blocked {
+                session_id: rec.session_id.clone(),
+                action: rec.action.clone(),
+                reason: format!("task store write failed: {err}"),
+            },
+        },
+        _ => unreachable!("dispatch_task_action only handles task-scoped variants"),
     }
 }
 
@@ -187,6 +237,15 @@ fn apply_one(
                     Err(err) => blocked(rec, &format!("stop failed: {err}")),
                 }
             }
+        }
+        Action::ReportProgress { .. } | Action::CompleteTask { .. } => {
+            // Task-store dispatch happens outside `Storage::update` because
+            // it touches a different on-disk file; see `dispatch_task_action`.
+            // The apply_one path only handles session-scoped actions.
+            blocked(
+                rec,
+                "task actions are dispatched outside the session-storage batch",
+            )
         }
         Action::NoOp => unreachable!("NoOp handled above"),
     }

@@ -16,6 +16,7 @@ pub mod observation;
 pub mod policies;
 pub mod reasoner;
 pub mod signals;
+pub mod tasks;
 pub mod watcher;
 
 /// Env var that gates every conductor surface. Absent or set to `0` / `false`

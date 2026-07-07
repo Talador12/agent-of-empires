@@ -142,6 +142,11 @@ pub enum Action {
     /// Stop the session's tmux pane (and its container if sandboxed).
     /// Gated by `ConductorPolicies::allow_destructive`.
     StopSession,
+    /// Append a progress note to a linked task. Non-destructive; always
+    /// allowed. `task_id` refers to a `TaskStore` entry.
+    ReportProgress { task_id: String, note: String },
+    /// Mark a linked task complete. Non-destructive; always allowed.
+    CompleteTask { task_id: String },
     /// Explicitly recommend doing nothing this tick.
     NoOp,
 }
