@@ -44,6 +44,17 @@ pub enum ConductorCommands {
         #[command(subcommand)]
         command: TaskCommands,
     },
+
+    /// Interactive REPL that shows the queue and runs one-shot ticks
+    /// with a line of user context folded into each prompt.
+    Chat(ConductorChatArgs),
+}
+
+#[derive(Args)]
+pub struct ConductorChatArgs {
+    /// Reasoner posture (see `watch --mode`).
+    #[arg(long, default_value = "balanced", value_parser = ["conservative", "balanced", "aggressive"])]
+    pub mode: String,
 }
 
 #[derive(Subcommand)]
@@ -247,6 +258,10 @@ pub async fn run(profile: &str, command: ConductorCommands) -> Result<()> {
         ConductorCommands::Watch(args) => watch(profile, args).await,
         ConductorCommands::Spawn(args) => spawn(profile, args).await,
         ConductorCommands::Task { command } => task(profile, command).await,
+        ConductorCommands::Chat(args) => {
+            let mode = ReasonerMode::from_cli(&args.mode).context("--mode")?;
+            crate::conductor::chat::run(profile, mode).await
+        }
     }
 }
 

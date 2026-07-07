@@ -6,6 +6,7 @@ use chrono::Utc;
 
 use crate::session::{Instance, Status};
 
+pub mod chat;
 pub mod errors;
 pub mod executor;
 pub mod github;
