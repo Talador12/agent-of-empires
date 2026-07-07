@@ -1,7 +1,5 @@
-//! Turn a fleet of `Instance`s into the `Observation` the reasoner sees.
-//! Skips archived / trashed / actively-snoozed rows the same way
-//! [`crate::conductor::attention_score`] does, so what the reasoner ranks
-//! matches what a human would see in `aoe conductor status`.
+//! Project a fleet of `Instance`s into the `Observation` the reasoner
+//! sees. Skips the same rows `attention_score` skips.
 
 use chrono::Utc;
 

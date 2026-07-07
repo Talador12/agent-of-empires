@@ -1,10 +1,6 @@
-//! Orchestrator ("conductor") that watches every session and recommends
-//! attention-directing actions across the fleet. Experimental, gated behind
-//! `AOE_EXPERIMENTAL_AO_MODE` per issue #553.
-//!
-//! This module ports the tick-loop core of the standalone `aoaoe` project
-//! (TypeScript) into aoe as a first-party feature. Mechanism lives in aoe
-//! (attention-stack primitives on `Instance`); policy lives here.
+//! Experimental orchestrator that ranks sessions by attention score and
+//! (when authorized) applies non-destructive actions on the user's
+//! behalf. Gated behind `AOE_EXPERIMENTAL_AO_MODE`. See issue #553.
 
 use chrono::Utc;
 

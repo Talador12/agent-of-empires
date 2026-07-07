@@ -1,14 +1,10 @@
-//! Policy layer for the conductor. Mechanism (mutating a session's
-//! attention-stack fields) lives in `Instance`; policy (which actions the
-//! conductor is allowed to take on the user's behalf) lives here. Default
-//! is conservative: non-destructive, never sends input into a session.
+//! Policy layer for the conductor. Ports aoaoe's `AoaoeConfig.policies`
+//! block. Mechanism lives on `Instance`; policy lives here.
+
+use std::time::Duration;
 
 /// User-facing policies applied to reasoner recommendations before the
-/// executor touches session state. Ports the shape of aoaoe's
-/// `AoaoeConfig.policies` block (see `src/types.ts` in that repo).
-///
-/// Every field defaults to a conservative value: destructive actions and
-/// nudges are off, cooldowns are generous, quiet hours are absent.
+/// executor touches session state. Every field defaults conservative.
 #[derive(Debug, Clone)]
 pub struct ConductorPolicies {
     /// Allow actions that remove a session from the active view
@@ -43,8 +39,6 @@ impl Default for ConductorPolicies {
         }
     }
 }
-
-use std::time::Duration;
 
 /// Parsed `HH:MM-HH:MM` window. Kept as a separate type so parse errors
 /// happen at construction, not on every tick.

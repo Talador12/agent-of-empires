@@ -1,9 +1,6 @@
-//! Apply reasoner recommendations to real session state. Loads the fleet,
-//! mutates the matching `Instance` via the attention-stack primitives on
-//! it (`snooze`, `favorite`, `unfavorite`, `archive`), and writes
-//! atomically through `Storage::update`. Nothing here talks to tmux or
-//! an agent process yet; nudge lands with the send-input pipe in a later
-//! commit.
+//! Apply reasoner recommendations to session state. Loads the fleet,
+//! mutates matching `Instance`s via the attention-stack primitives, and
+//! writes atomically through `Storage::update`.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

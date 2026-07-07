@@ -1,8 +1,5 @@
-//! Ports of the pure-computation "intelligence modules" from aoaoe that
-//! fit aoe's current state model without a session-output-pane feed.
-//! Everything here is a function of `Instance` fields (or scalar inputs
-//! the caller controls); anything that needs raw pane content stays as
-//! follow-up work called out in DESIGN.md.
+//! Ports of aoaoe's pure-computation intelligence modules that map onto
+//! `Instance` state without needing session output content.
 
 use std::collections::HashSet;
 use std::time::Duration;

@@ -1,8 +1,5 @@
-//! The reasoner produces action recommendations from an `Observation`
-//! snapshot of the fleet. Pluggable so the watch loop (commit 3) can be
-//! generic over the backend; only `ClaudePrintReasoner` ships today, with
-//! a subprocess call to `claude --print`. OpenCode HTTP and direct
-//! Anthropic SDK backends are follow-up work.
+//! Pluggable source of action recommendations. Backends live in
+//! submodules; the watch loop is generic over `Reasoner`.
 
 use std::future::Future;
 

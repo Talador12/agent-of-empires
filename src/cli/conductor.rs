@@ -1,7 +1,5 @@
-//! `aoe conductor` (alias `aoe ao`) command implementations. Experimental
-//! orchestrator over the local session list; gated on
-//! `AOE_EXPERIMENTAL_AO_MODE`. See `crate::conductor` for scoring and the
-//! forthcoming tick loop.
+//! `aoe conductor` (alias `aoe ao`) command implementations. Gated on
+//! `AOE_EXPERIMENTAL_AO_MODE`.
 
 use std::path::PathBuf;
 use std::time::Duration;

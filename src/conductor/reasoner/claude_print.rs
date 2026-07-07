@@ -1,8 +1,5 @@
-//! `Reasoner` backend that shells out to `claude --print`. Mirrors the
-//! `reasoner/claude-code.ts` path in aoaoe (the TypeScript project this
-//! feature is ported from). Zero new dependencies: uses the same `claude`
-//! binary aoe already launches for sessions, so no API key surface, no
-//! HTTP client, no SDK.
+//! `Reasoner` backend that shells out to `claude --print`. Mirrors
+//! aoaoe's `reasoner/claude-code.ts`.
 
 use anyhow::{Context, Result};
 use tokio::process::Command;

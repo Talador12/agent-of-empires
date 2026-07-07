@@ -1,8 +1,5 @@
-//! `/api/conductor/*` handlers. Experimental orchestrator surface (issue
-//! #553) exposed to the web dashboard and any scripted consumer that
-//! wants a fleet-wide attention view without spawning the CLI. Gate on
-//! `AOE_EXPERIMENTAL_AO_MODE` matches the CLI and TUI; without it, the
-//! endpoint returns 403 with a hint.
+//! `/api/conductor/*` handlers. Gate on `AOE_EXPERIMENTAL_AO_MODE`
+//! matches the CLI and TUI; without it, the endpoint returns 403.
 
 use std::sync::Arc;
 

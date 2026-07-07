@@ -1,8 +1,6 @@
 //! Full-screen conductor panel. Follows the `ServeView` shape: owns its
 //! own state, returns `ConductorAction` from `handle_key`, and takes over
-//! the whole screen while open. Display-only in this commit; the tick
-//! trigger + apply flow lands in a follow-up commit tracked in the PR
-//! description.
+//! the whole screen while open. Display-only for now.
 
 use std::time::Instant;
 

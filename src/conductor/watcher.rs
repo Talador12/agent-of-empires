@@ -1,7 +1,5 @@
-//! Tick loop that turns a fleet snapshot into logged recommendations. No
-//! action dispatch here; the executor lands in the next commit. `--once`
-//! exists for CI and e2e tests so the watch flow can be exercised without
-//! standing up a long-running loop.
+//! Tick loop that turns a fleet snapshot into recommendations and,
+//! optionally, applied actions via the executor.
 
 use std::time::Duration;
 

@@ -1,7 +1,5 @@
-//! Spawn one session per GitHub issue. Wraps the `gh` CLI (already the
-//! canonical GitHub client for aoe) rather than talking to the REST API
-//! directly, matching the "no new deps" bar the rest of the module holds.
-//! The demo scenario @Seluj78 and @jerome-benoit asked for in issue #553.
+//! Fetch open GitHub issues via the `gh` CLI so the conductor can spawn
+//! one session per issue.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
